@@ -5927,9 +5927,19 @@ impl<'a> Lower<'a> {
         // its size fields alone (width, height, base level: a texture's size
         // asked by hand). Taken as a 2D texture, whose dwords the host's
         // dimensions stand in for, as for a sampled one.
+        // A buffer view (four dwords) nothing reads through, likewise: the code asks for its
+        // record count alone (an optional buffer: none bound, nothing to do).
         let mut size_only = false;
+        let records = count == 4
+            && use_at.is_none()
+            && self
+                .used_kind(&Source::Loaded { load: site, first: 0 })
+                .is_some_and(|u| u.dwords == 4 && matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+            && inst.write(Reg::S(code + 2)).is_some_and(|v| {
+                x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.reads.iter().any(|r| r.1 == v))
+            });
         let Some((at, first)) = use_at.or_else(|| {
-            let lone = count == 8
+            let lone = (count == 8 || records)
                 && !self.x.res.lane_copied.contains(&site)
                 && !x.res.descriptors.iter().any(|d| {
                     d.source
@@ -6007,7 +6017,12 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = if size_only {
+        let (props, image) = if size_only && records {
+            match used.map_or(0, |u| u.stride) {
+                stride if stride >= 4 && stride.is_multiple_of(4) => ((12 | u, stride), None),
+                _ => ((11 | u, 0), None),
+            }
+        } else if size_only {
             ((2, 0x409), Some(2))
         } else {
             match &ui.fields {
@@ -6117,7 +6132,7 @@ impl<'a> Lower<'a> {
                 let mut words = vec![(2, n)];
                 // Its address too, where the code computes with it and the
                 // host can tell it.
-                let computed = (0..2u8).any(|k| {
+                let computed = size_only || (0..2u8).any(|k| {
                     inst.write(Reg::S(code + first + k))
                         .is_some_and(|v| self.computed_with(v, 6))
                 });
