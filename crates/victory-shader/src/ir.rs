@@ -225,9 +225,48 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             what: "a branch to the program entry",
         });
     }
+    close_sections(&mut blocks);
     split_irreducible(&mut blocks)?;
 
     Ok(rename(blocks, wave64, vgprs))
+}
+
+/// Puts the end of whole-wave sections back into them. Where the arms of a branch each open a
+/// section (`s_or_saveexec -1`) and end it with the same instructions, the compiler keeps those
+/// once, at the join. Each arm gets its own copy again, up to the restore of EXEC, so a section
+/// lies in one block (which is where `emit::wave` follows them).
+fn close_sections(blocks: &mut [Block]) {
+    let exec = |i: &Inst| i.write(Reg::S(EXEC)).is_some();
+    for j in 0..blocks.len() {
+        let Some(end) = blocks[j].insts.iter().position(exec) else {
+            continue;
+        };
+        let saved = match &blocks[j].insts[end].fields {
+            Fields::Sop { src, .. } if blocks[j].insts[end].name().starts_with("s_mov_b") => src.first(),
+            _ => None,
+        };
+        let Some(&Operand::Scalar { code, .. }) = saved else {
+            continue;
+        };
+        let keeps = |insts: &[Inst]| insts.iter().all(|i| i.write(Reg::S(code)).is_none());
+        let open = |&b: &usize| {
+            let insts = &blocks[b].insts;
+            b != j
+                && blocks[b].exit == Exit::Jump(j)
+                && insts.iter().rposition(exec).is_some_and(|start| {
+                    crate::emit::opens_section(&insts[start]) == Some(code) && keeps(&insts[start + 1..])
+                })
+        };
+        let preds = blocks[j].preds.clone();
+        if preds.len() < 2 || !preds.iter().all(open) || !keeps(&blocks[j].insts[..end]) {
+            continue;
+        }
+        let tail: Vec<Inst> = blocks[j].insts.drain(..=end).collect();
+        for b in preds {
+            blocks[b].insts.pop_if(|i| i.name() == "s_branch");
+            blocks[b].insts.extend_from_slice(&tail);
+        }
+    }
 }
 
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.

@@ -142,29 +142,13 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
-        // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`.
-        let all = match inst.name() {
-            "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(Operand::Const(193)),
-            "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(Operand::Const(128)),
-            _ => None,
-        };
-        let start = all.is_some_and(
-            |k| matches!(&inst.fields, Fields::Sop { src, .. } if src.first() == Some(&k)),
-        );
-        let saved = match &inst.fields {
-            Fields::Sop {
-                dst: Some(Operand::Scalar { code, .. }),
-                ..
-            } if start => inst.write(Reg::S(*code)),
-            _ => None,
-        };
-        let Some(saved) = saved else {
+        let found = opens_section(inst).and_then(|code| Some((code, inst.write(Reg::S(code))?)));
+        let Some((code, saved)) = found else {
             i += 1;
             continue;
         };
         let end = (i + 1..insts.len()).find(|&j| {
-            insts[j].write(Reg::S(EXEC)).is_some()
-                && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
+            insts[j].write(Reg::S(EXEC)).is_some() && insts[j].read(Reg::S(code)) == Some(saved)
         });
         let Some(end) = end else {
             break;
@@ -176,13 +160,21 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     out
 }
 
-fn saved_code(inst: &Inst) -> u8 {
+/// If `inst` makes EXEC every lane (`s_or_saveexec -1` or `s_nand_saveexec 0`): the register
+/// that keeps the old mask.
+pub(crate) fn opens_section(inst: &Inst) -> Option<u8> {
+    let all = match inst.name() {
+        "s_or_saveexec_b64" | "s_or_saveexec_b32" => Operand::Const(193),
+        "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Operand::Const(128),
+        _ => return None,
+    };
     match &inst.fields {
         Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
+            src,
             ..
-        } => *code,
-        _ => NULL,
+        } if src.first() == Some(&all) => Some(*code),
+        _ => None,
     }
 }
 
