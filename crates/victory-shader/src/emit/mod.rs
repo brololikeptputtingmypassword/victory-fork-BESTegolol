@@ -489,6 +489,15 @@ pub fn emit(
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
+                for (name, f) in &forms {
+                    if let Some((p, st, io, res)) = f.as_ref().and_then(|f| form(ir::with_tests_ahead(&f.0))) {
+                        let local = lower::with_local_waves_any(|| emit_program(c, native, &p, &st, &io, &res));
+                        report(&format!("local waves (APPROXIMATE, any mask), tests ahead, {name}"), &local);
+                        if done(&local) {
+                            return local.map(|(shader, _)| shader);
+                        }
+                    }
+                }
             }
         }
     }

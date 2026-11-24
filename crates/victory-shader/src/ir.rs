@@ -712,6 +712,45 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     Some(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// The program with scalar tests made ahead of the per-lane skip of the code they stand in:
+/// `s_and_saveexec; s_cbranch_execz L; ...; s_cmp_ge_i32 a, b; ...; L: s_cbranch_scc0 loop`,
+/// where the skip brings "no lane" along as SCC. Where the wave never skips as a whole (it
+/// would not leave the loop) a lane that skips alone, on a host that branches per lane, then
+/// brings the test's result as the console's other lanes do. `None` if there is none.
+pub(crate) fn with_tests_ahead(p: &Program) -> Option<Program> {
+    let mut blocks = p.blocks.clone();
+    let mut any = false;
+    for (b, block) in p.blocks.iter().enumerate() {
+        let Exit::Branch { taken, not_taken } = block.exit else { continue };
+        let body = &p.blocks[not_taken];
+        if block.insts.last().is_none_or(|i| i.name() != "s_cbranch_execz")
+            || body.preds != [b]
+            || body.exit != Exit::Jump(taken)
+        {
+            continue;
+        }
+        let Some(at) = body.insts.iter().rposition(|i| i.write(Reg::Scc).is_some()) else { continue };
+        let test = &body.insts[at];
+        let unchanged = |r: &(Reg, Value)| {
+            r.0 != Reg::S(EXEC) && !body.insts[..at].iter().any(|i| i.write(r.0).is_some())
+        };
+        if test.name().starts_with("s_cmp_") && test.writes.len() == 1 && test.reads.iter().all(unchanged) {
+            let branch = blocks[b].insts.len() - 1;
+            blocks[b].insts.insert(branch, test.clone());
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
 /// As [`without_early_outs`], and also without the branches that only skip a
 /// region when no lane is left for it: an `s_cbranch_execz` whose target is
 /// where the skipped code ends up anyway (`if (c) { ... }` with nothing
@@ -1698,6 +1737,35 @@ mod tests {
                     .is_some_and(|i| i.name() == "s_cbranch_execz")
             })
             .count()
+    }
+
+    #[test]
+    fn a_test_behind_a_skip_is_made_ahead_of_it() {
+        let p = build_words(
+            &[
+                0xBE99_0380, // s_mov_b32 s25, 0
+                0xBE82_244A, // s_and_saveexec_b64 s[2:3], s[74:75]
+                0xBF88_0002, // s_cbranch_execz past the body
+                0xBF03_1819, // s_cmp_ge_i32 s25, s24
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+                0xBF84_FFFA, // s_cbranch_scc0 back to the start
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let tests = |p: &Program| -> Vec<usize> {
+            p.blocks.iter().map(|b| b.insts.iter().filter(|i| i.name() == "s_cmp_ge_i32").count()).collect()
+        };
+        let ahead = with_tests_ahead(&p).expect("a test to move");
+        assert_eq!(tests(&p).iter().sum::<usize>(), 1);
+        assert_eq!(tests(&ahead).iter().sum::<usize>(), 2);
+        // SCC at the join is a test either way, not the mask operation's
+        let join = ahead.blocks.iter().find(|b| b.insts.iter().any(|i| i.name() == "s_cbranch_scc0")).unwrap();
+        let scc = join.phis.iter().find(|f| f.reg == Reg::Scc).unwrap();
+        for a in &scc.args {
+            assert!(ahead.blocks.iter().flat_map(|b| &b.insts).any(|i| i.write(Reg::Scc) == Some(*a) && i.name() == "s_cmp_ge_i32"));
+        }
     }
 
     #[test]
