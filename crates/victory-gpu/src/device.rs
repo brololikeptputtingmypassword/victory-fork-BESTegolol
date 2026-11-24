@@ -388,6 +388,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        #[cfg(windows)]
+        dump_pieces(SLOT, calls, desc as usize, description.as_deref());
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
@@ -397,6 +399,39 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     E_NOTIMPL
+}
+
+/// `VICTORY_PIPE_DUMP=<dir>`: writes a logged call's description, the
+/// object its first word names, and every (address, size) pair in it (or
+/// 4 KiB at an address with no size) to `<dir>/<slot>_<call>_*.bin`, so the
+/// two methods' descriptions can be decoded offline.
+#[cfg(windows)]
+fn dump_pieces(slot: usize, call: u32, desc: usize, words: Option<&[u64]>) {
+    let Some(dir) = std::env::var_os("VICTORY_PIPE_DUMP") else { return };
+    let Some(w) = words else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let save = |name: String, at: u64, len: usize| {
+        let mut bytes = vec![0u8; len];
+        if at != 0 && crate::host::read_into(at as *const u8, &mut bytes) {
+            let _ = std::fs::write(dir.join(format!("{slot:x}_{call}_{name}.bin")), &bytes);
+        }
+    };
+    save("desc".into(), desc as u64, 0x100);
+    save("w0".into(), w[0], 0x600);
+    let mut i = 1;
+    while i < w.len() {
+        let (at, next) = (w[i], w.get(i + 1).copied().unwrap_or(0));
+        if at > 0x1_0000_0000 && next > 0 && next < 0x10_0000 {
+            save(format!("w{i}_{next:x}"), at, next as usize);
+            i += 2;
+        } else {
+            if at > 0x1_0000_0000 && at < 0x7f00_0000_0000 {
+                save(format!("w{i}_ptr"), at, 0x1000);
+            }
+            i += 1;
+        }
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the

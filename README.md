@@ -1,27 +1,53 @@
-# VIctory fork: world rendering and speed (work in progress)
+# VIctory fork: the Xbox Series build of GTA VI, running on a Windows PC
+
+<p align="center">
+<img width="100%" alt="in the world on a PC: the dormitory, lit by the game's own lights" src="https://github.com/user-attachments/assets/d889d2cf-dc29-4e98-b832-dc43efca7d71" />
+<br/><sub>In the world on an RTX 3060 (2026-11-24). Real-time, through this fork; no emulator, no game files in this repo.</sub>
+</p>
+
+<p align="center">
+<img alt="status: in the world, 2-3 fps" src="https://img.shields.io/badge/status-in%20the%20world%2C%202--3%20fps-orange" />
+<img alt="platform" src="https://img.shields.io/badge/platform-Windows%2011%20%7C%20D3D12-blue" />
+<img alt="license" src="https://img.shields.io/badge/license-GPL--3.0--or--later-green" />
+<img alt="last update" src="https://img.shields.io/github/last-commit/brololikeptputtingmypassword/victory-fork-BESTegolol" />
+</p>
 
 A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork), which is itself a
 fork of [VIctory](https://github.com/Marvisak/VIctory): a compatibility layer that runs an
-Xbox Series title natively on Windows (Direct3D 12) from files the user supplies.
+Xbox Series title natively on Windows (Direct3D 12) from files the user supplies. The console's
+GPU programs (GFX10 machine code) are translated to DXIL; the console's system calls are
+answered on Windows.
 This fork pushes on two things: **the world drawing completely** and **frame rate**.
+Jump to: [current state](#current-state-updated-2026-11-24-evening) ·
+[what changed](#what-this-fork-changed) · [switches](#recommended-switches) ·
+[next](#next) · [getting started](#getting-started).
+If this helps you, a star helps others find it.
 
 **This repository contains no game files, code, shaders, dumps or keys.** You need your own
 copy of the game. Not affiliated with or endorsed by the game's developer or publisher.
 Licensed GPL-3.0-or-later, like everything it is built on.
 
-## Current state (updated 2026-11-24)
+## Current state (updated 2026-11-24, evening)
 
 Tested on: Windows 11, AMD Ryzen 7 5700X, NVIDIA RTX 3060 12 GB, 32 GB RAM.
 
+Screenshots from play sessions (in the world, ~8 minutes after launch; 1-3 fps):
+
+<img width="49%" alt="cell, dialogue" src="https://github.com/user-attachments/assets/5f704e91-0fc9-4344-8223-87e6975a661b" /> <img width="49%" alt="yard gate" src="https://github.com/user-attachments/assets/afc23132-8f6d-4ca9-b7b0-f542a8e1a8c2" />
+<img width="49%" alt="visitor window: green surfaces and blocky shadows still wrong" src="https://github.com/user-attachments/assets/398367c9-db70-40f0-abd0-0ad27ec4a03b" />
+
+Visible still wrong: some surfaces bright green, blocky shadow edges, light in shadow too
+dark, and walls/floors that are late to appear while the world streams in.
+
 | Area | State |
 |------|-------|
-| Boot, menus, start screen | works |
-| World geometry (walls, floors, ceilings, eyes) | **now drawn**: four pixel programs that were dropped (and their draws with them) now translate (see below) |
-| Shader translation (offline check over 2,124 programs saved from a play session) | vertex+pixel 888/888, mesh 165/165, compute 1,066/1,071 |
-| Light in shadow | still dark/black: the game's ray-traced lighting does not run yet (inherited, see the notes further down) |
-| Frame rate in the world | **about 2 fps** (1.3 fps with the old defaults; see the switch table) - CPU-bound: the card is idle about half of every frame |
-| First launch | long: thousands of pipelines are compiled on first run; later runs use the cache |
-| Start screen | still stutters and flashes |
+| Boot, menus | works |
+| World geometry (walls, floors, ceilings, eyes) | **now drawn**: four pixel programs that were dropped (and their draws with them) now translate (see below); some pieces are late while the world streams in |
+| Shader translation (offline check over 2,124 programs saved from a play session) | vertex+pixel 888/888, mesh 165/165, compute 1,066/1,071 before today's merge (re-check in progress) |
+| Ray-traced lighting (the game builds its own BVH in 53 compute programs) | **50 of 53 builder pipelines now made on a 32-lane NVIDIA GPU** (four were refused for 64-lane waves): the builder runs only when all are there, so light in shadow is still dark |
+| Frame rate in the world | **about 2-3 fps** (1.3 fps with the old defaults; see the switch table) - CPU-bound: the card is idle about half of every frame |
+| Loading | slow: about 5 minutes to the world on a warm cache |
+| Start screen | stutters: frames wait up to 500 ms for pipelines still being made (`VICTORY_PIPELINE_WAIT_MS`), while ~1,400 are compiled in the background |
 
 ## What this fork changed
 
@@ -36,6 +62,19 @@ Tested on: Windows 11, AMD Ryzen 7 5700X, NVIDIA RTX 3060 12 GB, 32 GB RAM.
    rebuild no longer means a slow first launch.
 3. **Configurable pipeline workers** (`VICTORY_PIPELINE_WORKERS`, `pipeline/make.rs`): more
    threads compile pipelines during loading screens.
+4. **Console 64-lane compute programs on 32-lane GPUs: LDS in lane branches**
+   (`lds_meetings` in `lower.rs`). Such a program runs as two host waves that meet at group
+   barriers around its shared-memory (LDS) accesses; a lane branch holding both an LDS read
+   and a write was refused, and NVIDIA refuses the 64-lane fallback. Now accepted when the
+   read and an atomic use one lane-uniform address with disjoint bytes (counters and
+   allocators), or the read and write both use lane-uniform addresses (a one-lane section).
+   `VICTORY_LDS_LOOSE=1` accepts the remaining cases too (a test switch: two host waves may
+   then see each other's LDS accesses out of the console's order).
+   `VICTORY_HOST_WAVE=32` makes offline `victory translate` stand in for a 32-lane GPU.
+5. **Translation gaps** (the second session's branch, merged): `v_cvt_f32_f64` and wave
+   sums of doubles, `v_fma_mixlo_f16` over interpolation halves, whole-wave sections whose
+   ends the compiler merged, a last form for 32-lane hosts, and a retry of cross-lane code
+   with every lane present.
 
 ## Recommended switches
 
@@ -68,10 +107,19 @@ for title memory remaps.
 
 ## Next
 
-- The 5 compute programs that still fail (`v_cvt_f32_f64`, `v_permlanex16_b32`, a 16-bit wave
-  sum, a descriptor address read as data).
+- **Precompiled pipelines (the biggest gap found so far).** The game makes most of its
+  pipelines through two console device methods (0x1c8 graphics, 0x218 compute) that no
+  VIctory fork implements: in one session they were called over 16,000 and 2,000 times and
+  every call failed, so the game draws without those pipelines. Their descriptions are being
+  decoded (`VICTORY_PIPE_DUMP=<dir>` saves them): a register block, the vertex input layout,
+  each stage's GFX10 code already in GPU memory and a resource table per stage.
+- The last ray-tracing builder programs on 32-lane GPUs ("a lane mask exchanged / a first-lane
+  read where not every lane runs"), then a run with `VICTORY_BVH_BUILDER=1` for light in shadow.
+- Start-screen stutter: a shorter pipeline wait, and pipelines a frame needs ahead of the
+  background prewarm queue.
+- Loading time, and textures held back by the VRAM budget (~12,000 waiting in the world).
 - Frame time: copy-back and the per-frame heap-buffer pass are the biggest CPU costs.
-- Start-screen stutter and flashing; light in shadow.
+- Green surfaces; the depth bounds test that host pipelines leave out.
 
 ---
 
