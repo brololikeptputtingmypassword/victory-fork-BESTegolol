@@ -7413,9 +7413,13 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                // A low half's other half may be a value that is none (an
+                // interpolation's first half, only ever read by the second):
+                // nothing reads it then, as in `low_half`.
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    Some(Err(why)) if name == "v_fma_mixhi_f16" => return Err(why),
+                    _ => self.s.m.i32(0),
                 };
                 let h = self
                     .s
