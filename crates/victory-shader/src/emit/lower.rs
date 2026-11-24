@@ -287,6 +287,8 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// The last [`Self::double_sum`] made: its block, sources and mask, and its dwords.
+    last_double_sum: Option<((usize, (Value, Value), Value), [V; 2])>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1766,6 +1768,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            last_double_sum: None,
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1999,6 +2002,9 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::ActiveDouble(src, mask, high) => {
+                return Ok(self.double_sum(src, mask)?[usize::from(high)]);
+            }
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -2180,6 +2186,58 @@ impl<'a> Lower<'a> {
             r
         };
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// A double from its dwords.
+    fn make_double(&mut self, lo: V, hi: V) -> V {
+        self.s.flags |= flags::DOUBLE;
+        let f64t = self.s.m.double();
+        self.s.op(self.cur, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi])
+    }
+
+    fn split_double(&mut self, x: V) -> [V; 2] {
+        let (c, i32t) = (self.cur, self.s.t.i32);
+        let two = self.s.m.named_struct("dx.types.splitdouble", vec![i32t; 2]);
+        let r = self.s.op(c, "splitDouble.f64", Attr::ReadNone, two, 102, &[x]);
+        [self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1)]
+    }
+
+    /// The dwords of the sum of the doubles `src` (low and high dword) of the lanes in `mask`.
+    fn double_sum(&mut self, src: (Value, Value), mask: Value) -> Result<[V; 2], Why> {
+        use super::wave::Shape;
+        // (a section reads the two dwords one after the other)
+        let key = (self.cur_ir, src, mask);
+        if let Some((k, words)) = self.last_double_sum
+            && k == key
+        {
+            return Ok(words);
+        }
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        // as other sums: two host waves add their halves, unless each is a wave of its own
+        let halves = !self.local && self.exchange.as_ref().is_some_and(|e| !e.1);
+        if halves && !self.all_lanes(self.cur_ir) {
+            need(self.cur_ir);
+            return Err("a wave reduction where not every lane runs");
+        }
+        let lo = self.shape(Shape::Masked(src.0, mask, 0), false)?;
+        let hi = self.shape(Shape::Masked(src.1, mask, 0), false)?;
+        let x = self.make_double(lo, hi);
+        self.s.flags |= flags::WAVE_OPS;
+        let (f64t, k0) = (self.s.m.double(), self.s.m.i8(0));
+        let sum = self.s.op(self.cur, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[x, k0, k0]);
+        let mut words = self.split_double(sum);
+        if halves {
+            let lows = self.exchange_halves(self.cur, words[0]);
+            let highs = self.exchange_halves(self.cur, words[1]);
+            let a = self.make_double(lows.0, highs.0);
+            let b = self.make_double(lows.1, highs.1);
+            let sum = self.s.m.bin(self.cur, Bin::Add, a, b);
+            words = self.split_double(sum);
+        }
+        self.last_double_sum = Some((key, words));
+        Ok(words)
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
@@ -7371,6 +7429,21 @@ impl<'a> Lower<'a> {
                     Cast::UiToFp
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
+                float(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                if v.abs != 0 || v.neg != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+                    return Err("64-bit operand modifiers");
+                }
+                let (lo, hi) = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => (Reg::V(reg), Reg::V(reg + 1)),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => (Reg::S(code), Reg::S(code + 1)),
+                    _ => return Err("a constant as a double"),
+                };
+                let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+                let hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+                let x = self.make_double(lo, hi);
+                let r = self.s.m.cast(c, Cast::FpTrunc, x, self.s.t.f32);
                 float(self, r)
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
