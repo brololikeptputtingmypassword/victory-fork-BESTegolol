@@ -1075,6 +1075,7 @@ fn lds_access(i: &Inst, same: &HashSet<Value>) -> LdsAccess {
 ///   of them;
 /// - a read and a plain write, both at lane-uniform addresses: taken as a section one lane
 ///   runs (several lanes reading and then writing one dword race on the console too).
+///
 /// shortcut: the second rule does not prove that only one lane gets there.
 fn lds_region_ordered(acc: &[LdsAccess]) -> bool {
     let meet = |a: &LdsAccess, w: &LdsAccess| {

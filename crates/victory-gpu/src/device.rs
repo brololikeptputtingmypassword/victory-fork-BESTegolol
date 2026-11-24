@@ -359,7 +359,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -368,6 +368,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
+    }
+    #[cfg(windows)]
+    if crate::pipeline::precompiled_on()
+        && let Some(hr) = precompiled(SLOT, calls, desc as usize, iid, out)
+    {
+        return hr;
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
@@ -399,6 +405,65 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     E_NOTIMPL
+}
+
+/// A precompiled pipeline's description: an object, then (address, size)
+/// pairs up to a null address or a word that is no size: a register block,
+/// for graphics the vertex input layout, and per stage its code (in GPU
+/// memory) and a resource table. Each code piece opens with its source
+/// shader's hash prologue ([`crate::pipeline::by_prologue`]).
+/// A compute pipeline (0x218) whose shader's container the title has made
+/// a pipeline with is made from that container; graphics pipelines
+/// (0x1c8) need their state decoded from the register block first, so
+/// they are only counted. `None`: the call fails as before.
+#[cfg(windows)]
+fn precompiled(slot: usize, calls: u32, desc: usize, iid: *const Iid, out: *mut This) -> Option<HRESULT> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // Per method: calls whose code pieces were all known, and not.
+    static FOUND: [[AtomicU32; 2]; 2] = [const { [const { AtomicU32::new(0) }; 2] }; 2];
+    let mut bytes = [0u8; 256];
+    if desc == 0 || !crate::host::read_into(desc as *const u8, &mut bytes) {
+        return None;
+    }
+    let w: Vec<u64> = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    let mut shaders = Vec::new();
+    let mut missing = 0;
+    let mut i = 1;
+    while i + 1 < w.len() && w[i] > 0x1_0000_0000 && w[i + 1] > 0 && w[i + 1] < 0x100_0000 {
+        let mut head = [0u8; 24];
+        if w[i + 1] >= 24
+            && crate::host::read_into(w[i] as *const u8, &mut head)
+            && crate::pipeline::is_prologue(&head)
+        {
+            match crate::pipeline::by_prologue(&head) {
+                Some(s) => shaders.push(s),
+                None => missing += 1,
+            }
+        }
+        i += 2;
+    }
+    let m = usize::from(slot == 0x218);
+    let all = missing == 0 && !shaders.is_empty();
+    FOUND[m][usize::from(!all)].fetch_add(1, Ordering::Relaxed);
+    if calls.is_power_of_two() {
+        tracing::info!(
+            slot = format_args!("{slot:#x}"),
+            calls,
+            all_known = FOUND[m][0].load(Ordering::Relaxed),
+            not = FOUND[m][1].load(Ordering::Relaxed),
+            "precompiled pipelines: calls whose source shaders' containers are known"
+        );
+    }
+    if slot == 0x218 && all && shaders.len() == 1 && shaders[0].stage == "compute" {
+        let cs = shaders.pop()?;
+        return Some(crate::pipeline::create_precompiled_compute(cs, iid, out));
+    }
+    None
 }
 
 /// `VICTORY_PIPE_DUMP=<dir>`: writes a logged call's description, the

@@ -100,11 +100,14 @@ pub(crate) fn kept() -> [u64; 7] {
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
+    let mut new = false;
+    let s = SHADERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            new = true;
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
@@ -115,7 +118,68 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
             })
         })
-        .clone()
+        .clone();
+    if new && precompiled_on() {
+        index_prologues(&s);
+    }
+    s
+}
+
+/// Native programs open with three instructions carrying the source
+/// shader's hash; a precompiled pipeline's code (device methods 0x1c8 and
+/// 0x218) opens with the same 24 bytes, though the rest of it is compiled
+/// for that pipeline. Containers by those bytes.
+static BY_PROLOGUE: Mutex<Option<HashMap<[u8; 24], Arc<Shader>>>> = Mutex::new(None);
+
+/// `VICTORY_PRECOMPILED=1`: precompiled pipelines whose source shaders'
+/// containers are known are made from them. Off by default: the title asks
+/// for them at boot, before it has made pipelines from containers (one run:
+/// 6 of 2048 compute and 0 of 16384 graphics calls found), and it appears
+/// to make the same shaders from their containers when the call fails.
+pub(crate) fn precompiled_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED").is_some_and(|v| v == "1"))
+}
+
+/// Whether `code` opens like a native program (the hash-carrying prologue).
+pub(crate) fn is_prologue(code: &[u8; 24]) -> bool {
+    code[2..4] == [0x80, 0xd5] && code[14..16] == [0x80, 0xd5]
+}
+
+fn index_prologues(s: &Arc<Shader>) {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(&s.container) else { return };
+    let Some(programs) = c
+        .part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+    else {
+        return;
+    };
+    let mut map = BY_PROLOGUE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    for p in programs {
+        if let Some(key) = p.code.get(..24).and_then(|k| <[u8; 24]>::try_from(k).ok()) {
+            map.entry(key).or_insert_with(|| s.clone());
+        }
+    }
+}
+
+/// The container whose native code opens with `prologue`, if the title
+/// has made a pipeline with it.
+pub(crate) fn by_prologue(prologue: &[u8; 24]) -> Option<Arc<Shader>> {
+    BY_PROLOGUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(prologue).cloned()
+}
+
+/// Device method 0x218 (a precompiled compute pipeline), made from the
+/// container of the same source shader (found by [`by_prologue`]).
+pub(crate) fn create_precompiled_compute(cs: Arc<Shader>, iid: *const Iid, out: *mut This) -> HRESULT {
+    hand_out(
+        vec![cs],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
 }
 
 /// A translated shader and the console resources its code reads.

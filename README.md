@@ -34,7 +34,7 @@ Tested on: Windows 11, AMD Ryzen 7 5700X, NVIDIA RTX 3060 12 GB, 32 GB RAM.
 Screenshots from play sessions (in the world, ~8 minutes after launch; 1-3 fps):
 
 <img width="49%" alt="cell, dialogue" src="https://github.com/user-attachments/assets/5f704e91-0fc9-4344-8223-87e6975a661b" /> <img width="49%" alt="yard gate" src="https://github.com/user-attachments/assets/afc23132-8f6d-4ca9-b7b0-f542a8e1a8c2" />
-<img width="49%" alt="visitor window: green surfaces and blocky shadows still wrong" src="https://github.com/user-attachments/assets/398367c9-db70-40f0-abd0-0ad27ec4a03b" />
+<img width="49%" alt="visitor window: green surfaces and blocky shadows still wrong" src="https://github.com/user-attachments/assets/398367c9-db70-40f0-abd0-0ad27ec4a03b" /> <img width="49%" alt="sunset through the visiting room window" src="https://github.com/user-attachments/assets/5f7004e7-a4bd-41be-94b9-8dd92d29b17b" />
 
 Visible still wrong: some surfaces bright green, blocky shadow edges, light in shadow too
 dark, and walls/floors that are late to appear while the world streams in.
@@ -107,12 +107,14 @@ for title memory remaps.
 
 ## Next
 
-- **Precompiled pipelines (the biggest gap found so far).** The game makes most of its
-  pipelines through two console device methods (0x1c8 graphics, 0x218 compute) that no
-  VIctory fork implements: in one session they were called over 16,000 and 2,000 times and
-  every call failed, so the game draws without those pipelines. Their descriptions are being
-  decoded (`VICTORY_PIPE_DUMP=<dir>` saves them): a register block, the vertex input layout,
-  each stage's GFX10 code already in GPU memory and a resource table per stage.
+- **Precompiled pipelines.** The game first asks for its pipelines through two console device
+  methods that no VIctory fork implements (0x1c8 graphics, 0x218 compute; over 16,000 and
+  2,000 calls at boot), and every call fails. Each piece of precompiled code opens with its
+  source shader's hash, and the same shaders later arrive as ordinary containers, so the game
+  appears to fall back to compiling those; making the precompiled ones directly could cut
+  loading time. Decoded so far (`VICTORY_PIPE_DUMP=<dir>` saves them): a register block, the
+  vertex input layout, each stage's GFX10 code in GPU memory and a resource table per stage.
+  `VICTORY_PRECOMPILED=1` makes the compute ones from known containers (few are known at boot).
 - The last ray-tracing builder programs on 32-lane GPUs ("a lane mask exchanged / a first-lane
   read where not every lane runs"), then a run with `VICTORY_BVH_BUILDER=1` for light in shadow.
 - Start-screen stutter: a shorter pipeline wait, and pipelines a frame needs ahead of the
