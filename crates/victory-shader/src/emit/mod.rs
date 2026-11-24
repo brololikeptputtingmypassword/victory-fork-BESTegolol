@@ -329,6 +329,14 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
+    let form = |p: Option<ir::Program>| {
+        p.and_then(|p| {
+            let st = structure::structure(&p).ok()?;
+            let io = io::raise(&p, native).ok()?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+            Some((p, st, io, res))
+        })
+    };
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
@@ -362,14 +370,6 @@ pub fn emit(
         };
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
-        let form = |p: Option<ir::Program>| {
-            p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
-                Some((p, st, io, res))
-            })
-        };
         let forms = [
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
@@ -501,6 +501,23 @@ pub fn emit(
             }
         }
     }
+    // Cross-lane code where not every lane runs, on a host whose waves may be of any size:
+    // once more with every lane there, where that is all it wants.
+    let original = match original {
+        Err(ShaderError::Unsupported { what, .. })
+            if native.stage == HwStage::Cs
+                && native.wave64
+                && lower::host_max_wave() != 32
+                && lower::needs_every_lane(what) =>
+        {
+            [ir::without_early_outs(p), ir::without_skips(p, false)]
+                .into_iter()
+                .filter_map(form)
+                .find_map(|(p, st, io, res)| emit_program(c, native, &p, &st, &io, &res).ok())
+                .map_or(original, Ok)
+        }
+        other => other,
+    };
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).
