@@ -1,3 +1,82 @@
+# VIctory fork: world rendering and speed (work in progress)
+
+A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork), which is itself a
+fork of [VIctory](https://github.com/Marvisak/VIctory): a compatibility layer that runs an
+Xbox Series title natively on Windows (Direct3D 12) from files the user supplies.
+This fork pushes on two things: **the world drawing completely** and **frame rate**.
+
+**This repository contains no game files, code, shaders, dumps or keys.** You need your own
+copy of the game. Not affiliated with or endorsed by the game's developer or publisher.
+Licensed GPL-3.0-or-later, like everything it is built on.
+
+## Current state (updated 2026-11-24)
+
+Tested on: Windows 11, AMD Ryzen 7 5700X, NVIDIA RTX 3060 12 GB, 32 GB RAM.
+
+| Area | State |
+|------|-------|
+| Boot, menus, start screen | works |
+| World geometry (walls, floors, ceilings, eyes) | **now drawn**: four pixel programs that were dropped (and their draws with them) now translate (see below) |
+| Shader translation (offline check over 2,124 programs saved from a play session) | vertex+pixel 888/888, mesh 165/165, compute 1,066/1,071 |
+| Light in shadow | still dark/black: the game's ray-traced lighting does not run yet (inherited, see the notes further down) |
+| Frame rate in the world | **about 2 fps** (1.3 fps with the old defaults; see the switch table) - CPU-bound: the card is idle about half of every frame |
+| First launch | long: thousands of pipelines are compiled on first run; later runs use the cache |
+| Start screen | still stutters and flashes |
+
+## What this fork changed
+
+1. **Image descriptors used only for their size** (`crates/victory-shader/src/emit/lower.rs`).
+   Some pixel programs load an 8-dword image descriptor only to compute the texture's width,
+   height and base level, never sampling it. The translator refused these ("a descriptor read
+   only as data"), the whole program failed and every draw using it was dropped - that is
+   where walls, floors and eyes went. Such a load is now bound as a 2D texture so the size
+   math reads real values. `VICTORY_SIZE_ONLY_DESC=0` restores the old behaviour.
+2. **Shader cache keyed by the translator's content** (`crates/victory-gpu/build.rs`,
+   `shader_cache.rs`): the cache survives rebuilds that do not change the translator, so a
+   rebuild no longer means a slow first launch.
+3. **Configurable pipeline workers** (`VICTORY_PIPELINE_WORKERS`, `pipeline/make.rs`): more
+   threads compile pipelines during loading screens.
+
+## Recommended switches
+
+Measured with an automatic A/B runner (each setup 7 minutes, frames averaged after loading):
+
+| Setup | avg fps | ms/frame |
+|-------|---------|----------|
+| `VICTORY_RELAY=2 VICTORY_PIPELINE_WORKERS=14 VICTORY_TEXTURE_NO_WAIT=1` | 1.34 | 867 |
+| + `VICTORY_WIDE_BACK=1` | **2.11** | **488** |
+| + `VICTORY_CARD_BUFFERS_MIN_MB=4` | 1.59 | 642 |
+| + `VICTORY_INPLACE=1` | 1.56 | 816 |
+
+`VICTORY_TEXTURE_NO_WAIT=1` lets texture refreshes read through the kernel instead of waiting
+for title memory remaps.
+
+## How the work is done
+
+- **Find what fails.** `VICTORY_SHADER_SAVE=<dir>` saves every program the title submits during
+  play. `victory translate <dir> --list --validate --pipelines --jobs N` translates them all
+  offline and lists every failure by reason; `victory shader-info <file> --disasm` shows one.
+- **Fix, then check for regressions** by translating the whole saved set before and after
+  (each fix has an off switch so before/after runs come from the same build).
+- **Measure speed** from the per-second counters the host logs (preparing / copies / GPU /
+  copy-back / heap passes), with runs started and stopped by script and pad input
+  scripted with `VICTORY_KEYS`.
+- **Frame captures**: RenderDoc 1.47 cannot capture this title in the world on a 12 GB card -
+  saving the initial state of ~18,600 resources runs out of memory and ends the game.
+- Done with [Claude Code](https://claude.com/claude-code); two sessions work in parallel
+  (one on translation gaps in a separate worktree, one on speed and testing).
+
+## Next
+
+- The 5 compute programs that still fail (`v_cvt_f32_f64`, `v_permlanex16_b32`, a 16-bit wave
+  sum, a descriptor address read as data).
+- Frame time: copy-back and the per-frame heap-buffer pass are the biggest CPU costs.
+- Start-screen stutter and flashing; light in shadow.
+
+---
+
+*Below: the notes of the fork this one is based on (fxceless/victory-fork), unchanged.*
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
