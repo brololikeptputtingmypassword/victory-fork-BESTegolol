@@ -5530,7 +5530,23 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        // An image descriptor (eight dwords) nothing samples: the code reads
+        // its size fields alone (width, height, base level: a texture's size
+        // asked by hand). Taken as a 2D texture, whose dwords the host's
+        // dimensions stand in for, as for a sampled one.
+        let mut size_only = false;
+        let Some((at, first)) = use_at.or_else(|| {
+            let lone = count == 8
+                && !self.x.res.lane_copied.contains(&site)
+                && !x.res.descriptors.iter().any(|d| {
+                    d.source.leaves().into_iter().any(
+                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
+                    )
+                })
+                && std::env::var_os("VICTORY_SIZE_ONLY_DESC").is_none_or(|v| v != "0");
+            size_only = lone;
+            lone.then_some((site, 0))
+        }) else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5578,6 +5594,9 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            if std::env::var_os("VICTORY_WHY_DESC").is_some() {
+                eprintln!("desc-as-data: load {site:?} block@{:#x} {} addr {:?}", self.x.p.blocks[site.0].offset, inst.name(), self.scalar.get(&site).copied());
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -5588,7 +5607,10 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
+        let (props, image) = if size_only {
+            ((2, 0x409), Some(2))
+        } else {
+            match &ui.fields {
             // A ray-tracing structure in a buffer of the host: read raw.
             Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
             Fields::Image { dim, .. } => {
@@ -5629,6 +5651,7 @@ impl<'a> Lower<'a> {
                 return Err("a constant buffer's descriptor read as data");
             }
             _ => return Err("a scalar memory read as data"),
+            }
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;

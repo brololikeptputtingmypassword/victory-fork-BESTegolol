@@ -43,7 +43,18 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // The translator's sources and this file's entry encoding (build.rs),
+        // not the whole executable: a rebuild that leaves them as they were
+        // keeps the cache. `VICTORY_SHADER_CACHE_EXE=1` keys on the
+        // executable as before.
+        let exe = if std::env::var_os("VICTORY_SHADER_CACHE_EXE").is_some() {
+            std::env::current_exe().and_then(std::fs::read)
+        } else {
+            let mut key = b"translator ".to_vec();
+            key.extend_from_slice(env!("VICTORY_TRANSLATOR_FINGERPRINT").as_bytes());
+            key.push(u8::from(cfg!(feature = "diagnostics")));
+            Ok(key)
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
