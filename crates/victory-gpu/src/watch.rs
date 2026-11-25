@@ -244,9 +244,31 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
+/// `VICTORY_GUARD_HEAPS=1` (off by default): write-watched ranges of at
+/// least [`HEAP_GUARD_MIN`] bytes are guarded like views (read-only, a
+/// fault opens the written block) instead of asked of the kernel. A frame
+/// asked about 7.2 GB, 7.1 GB of it unchanged, 2,270 askings and 48-64 ms
+/// of kernel time (hG4); guarded, unchanged memory costs a set lookup and
+/// only written blocks cost a fault. `=<MB>` sets the least size.
+fn heap_guard(first: usize, last: usize) -> bool {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| match std::env::var("VICTORY_GUARD_HEAPS").ok().as_deref() {
+        None | Some("0") => usize::MAX,
+        Some("1") => HEAP_GUARD_MIN,
+        Some(mb) => mb.parse::<usize>().map_or(HEAP_GUARD_MIN, |mb| mb << 20),
+    });
+    (last - first) * PAGE >= min
+}
+
+const HEAP_GUARD_MIN: usize = 4 << 20;
+
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if heap_guard(first, last) {
+        // Left to `writes`, which guards it.
+        return false;
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -321,8 +343,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let heap = guarded && heap_guard(first, last);
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
+    let failed = heap || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
@@ -339,7 +362,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        let written = guard(first * PAGE, last * PAGE, heap);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         written?
@@ -598,7 +621,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+fn guard(start: usize, end: usize, heap: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -612,7 +635,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
-    if !known && !is_view(start, end) {
+    if !known && !heap && !is_view(start, end) {
         return None;
     }
     install();
@@ -1064,6 +1087,36 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// `VICTORY_GUARD_HEAPS`: private write-watched memory is guarded as
+    /// views are, a write found by the fault it takes.
+    #[test]
+    fn heaps_are_guarded_when_asked() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let pages = |b: usize| p / PAGE + b * BLOCK / PAGE..p / PAGE + (b + 1) * BLOCK / PAGE;
+        // Not a view: without the switch's word, not guarded.
+        assert_eq!(guard(p, p + 4 * BLOCK, false), None);
+        assert_eq!(guard(p, p + 4 * BLOCK, true), Some((0..4).flat_map(pages).collect()));
+        assert_eq!(guard(p, p + 4 * BLOCK, true), Some(Vec::new()), "nothing written since");
+        // SAFETY: committed, guarded by us; the fault opens it.
+        unsafe { ((p + 2 * BLOCK + 8) as *mut u8).write_volatile(7) };
+        assert_eq!(guard(p, p + 4 * BLOCK, true), Some(pages(2).collect()));
+        assert_eq!(guard(p, p + 4 * BLOCK, true), Some(Vec::new()));
+        // SAFETY: our allocation, read-only now; open it before freeing.
+        unsafe { ((p + 2 * BLOCK + 8) as *mut u8).write_volatile(7) };
+        title_memory_remapped(p, 4 * BLOCK);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]
@@ -1086,7 +1139,7 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert!(guard(view, view + 2 * BLOCK, false).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
@@ -1104,18 +1157,18 @@ mod tests {
         writing(view + 100, 13);
         // Guarded again before the read: it fails as if never opened, and
         // opening again lets it through.
-        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(guard(view, view + 2 * BLOCK, false).is_some());
         assert!(refused(read(&mut file)));
         // Pinned, it is not guarded, and is reported written, until the write
         // is over.
         let first = (view / PAGE..view / PAGE + 1).collect::<Vec<_>>();
         let pin = kernel_writing(view + 100, 13);
-        assert_eq!(guard(view, view + 2 * BLOCK), Some(first.clone()));
+        assert_eq!(guard(view, view + 2 * BLOCK, false), Some(first.clone()));
         assert_eq!(read(&mut file), Ok(13));
-        assert_eq!(guard(view, view + 2 * BLOCK), Some(first.clone()));
+        assert_eq!(guard(view, view + 2 * BLOCK, false), Some(first.clone()));
         drop(pin);
-        assert_eq!(guard(view, view + 2 * BLOCK), Some(first));
-        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(view, view + 2 * BLOCK, false), Some(first));
+        assert_eq!(guard(view, view + 2 * BLOCK, false), Some(Vec::new()));
         assert!(refused(read(&mut file)));
         writing(view + 100, 13);
         assert_eq!(read(&mut file), Ok(13));
@@ -1123,7 +1176,7 @@ mod tests {
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
         assert_eq!(
-            guard(view, view + 2 * BLOCK),
+            guard(view, view + 2 * BLOCK, false),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         // SAFETY: our view.
@@ -1181,7 +1234,7 @@ mod tests {
         let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
         commit(start, BLOCK);
         commit(early, KERNEL_PAGE);
-        let refresh = || guard(start, start + SIZE).unwrap();
+        let refresh = || guard(start, start + SIZE, false).unwrap();
         assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
         // The last block is still entirely reserved.
         assert!(!refresh().contains(&(late / PAGE)));
@@ -1262,15 +1315,15 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         // The range begins in the placeholder, its middle block is a view.
         assert!(is_view(p, p + 3 * BLOCK));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()), "nothing written since");
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(Vec::new()), "nothing written since");
         // SAFETY: inside the mapped middle block.
         unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(pages(1).collect()));
         let first = map(0);
         title_memory_remapped(p, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(0).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(pages(0).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(Vec::new()));
         // Memory of ours that is no view stays none.
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
@@ -1349,16 +1402,16 @@ mod tests {
         let first = map(0);
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(all));
         assert_eq!(
-            guard(p, p + 3 * BLOCK),
+            guard(p, p + 3 * BLOCK, false),
             Some(Vec::new()),
             "nothing written since"
         );
         let second = map(1);
         title_memory_remapped(p + BLOCK, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK, false), Some(Vec::new()));
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
