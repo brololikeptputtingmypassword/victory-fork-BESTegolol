@@ -496,12 +496,13 @@ pub fn emit(
                 }
             }
         }
-        // `VICTORY_WAVE64_APPROX` (on unless `0`): a program no form above takes keeps
+        // `VICTORY_WAVE64_APPROX` (off unless `1`; on it cost ~90 ms of card time a frame in game
+        // and left rooms as dark): a program no form above takes keeps
         // 64-lane waves, which the host refuses, and its dispatches are dropped (the light
         // and fog volume, 926c46bab3b86bd6). Last of all, the wave-wide branches even where
         // `VICTORY_WAVE_WIDE` leaves them off: their group barriers in branches and loops
         // are a risk taken only for programs that would otherwise not run at all.
-        let approx_on = std::env::var_os("VICTORY_WAVE64_APPROX").is_none_or(|v| v != "0");
+        let approx_on = std::env::var_os("VICTORY_WAVE64_APPROX").is_some_and(|v| v == "1");
         if approx_on && !wide_on {
             let deep = form(ir::without_skips(p, true));
             let bases = [
