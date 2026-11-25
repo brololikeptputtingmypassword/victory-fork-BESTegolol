@@ -183,6 +183,9 @@ struct Block {
     phis: Vec<u32>,
     body: Vec<u32>,
     term: Option<Term>,
+    /// The block that goes on where this one was split ([`Module::chain`]): code added to
+    /// this one goes there.
+    next: Option<usize>,
 }
 
 /// Function attributes of a `dx.op` declaration.
@@ -413,6 +416,7 @@ impl Module {
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
+        let block = self.last(block);
         self.blocks[block].body.push(i);
         V::Inst(i)
     }
@@ -495,10 +499,36 @@ impl Module {
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
+        let incoming = incoming.into_iter().map(|(v, b)| (v, self.last(b))).collect();
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.last(block);
         self.blocks[block].term = Some(t);
+    }
+    pub fn terminated(&self, block: usize) -> bool {
+        self.blocks[self.last(block)].term.is_some()
+    }
+    /// The piece of `block` code goes to now: the last block it was split into.
+    pub fn last(&self, mut block: usize) -> usize {
+        while let Some(n) = self.blocks[block].next {
+            block = n;
+        }
+        block
+    }
+    /// `block` (terminated) goes on in `cont`: code added to `block` from now on, its
+    /// terminator and the joins it leads to are `cont`'s. (A block split in the middle, with
+    /// the code that holds the old block's number left as it is.)
+    pub fn chain(&mut self, block: usize, cont: usize) {
+        debug_assert!(self.blocks[block].next.is_none() && self.blocks[block].term.is_some());
+        self.blocks[block].next = Some(cont);
+        for inst in &mut self.insts {
+            if let Op::Phi(incoming) = &mut inst.op {
+                for (_, b) in incoming.iter_mut().filter(|(_, b)| *b == block) {
+                    *b = cont;
+                }
+            }
+        }
     }
 
     pub fn md_str(&mut self, s: &str) -> Md {

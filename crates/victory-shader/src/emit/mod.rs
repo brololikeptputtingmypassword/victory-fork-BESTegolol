@@ -409,8 +409,11 @@ pub fn emit(
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
-                // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                // ([`widen`]), at two group barriers per such branch. (A group of several
+                // console waves with `VICTORY_WAVE_PAIR_SYNC=1`: its pairs meet on their own.)
+                let several = matches!(native.io, crate::native::StageIo::Cs(cs)
+                    if cs.threads.iter().product::<u32>() > 64);
+                if wide_on || several && lower::pair_sync_on() {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -592,6 +595,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // (several console waves: their host-wave pairs meet on their own)
+        crate::native::StageIo::Cs(cs)
+            if lower::pair_sync_on() && cs.threads.iter().product::<u32>() % 64 == 0 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

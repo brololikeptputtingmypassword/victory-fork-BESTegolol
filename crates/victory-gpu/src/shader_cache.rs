@@ -81,6 +81,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
                     "VICTORY_WAVE64_APPROX",
+                    "VICTORY_WAVE_PAIR_SYNC",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
