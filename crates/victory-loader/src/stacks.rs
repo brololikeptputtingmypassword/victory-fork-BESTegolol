@@ -42,6 +42,36 @@ pub fn dump_stacks_on_schedule() {
     });
 }
 
+/// Reads `VICTORY_STALL_STACKS=<ms>[,<dumps>]` and, if set, starts a thread that prints
+/// every thread's stack when `frames` (frames begun) has not moved for that long: what
+/// the title is in while a frame hitches. At most `dumps` (8) stalls are printed, one dump
+/// each, a stall being a frame count that sat still that long.
+pub fn dump_stacks_on_stall(frames: fn() -> u64) {
+    let Ok(spec) = std::env::var("VICTORY_STALL_STACKS") else {
+        return;
+    };
+    let mut parts = spec.split(',').map(|p| p.trim().parse::<u64>().ok());
+    let ms = parts.next().flatten().unwrap_or(250).max(20);
+    let mut left = parts.next().flatten().unwrap_or(8);
+    std::thread::spawn(move || {
+        let (mut seen, mut since, mut dumped) = (frames(), std::time::Instant::now(), true);
+        while left > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let now = frames();
+            if now != seen {
+                (seen, since, dumped) = (now, std::time::Instant::now(), false);
+                continue;
+            }
+            // (not before the first frame: loading is one long stall)
+            if !dumped && seen > 0 && since.elapsed().as_millis() as u64 >= ms {
+                eprintln!("stall: frame {seen} has not moved for {ms} ms; every thread:");
+                dump_stacks();
+                (dumped, left) = (true, left - 1);
+            }
+        }
+    });
+}
+
 /// `THREAD_BASIC_INFORMATION` (ntddk).
 #[repr(C)]
 struct BasicInfo {
