@@ -1328,6 +1328,16 @@ mod wide_tests {
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Why [`Shadow::merge_under_writes`] left a settle due: the copy is not
+/// watched, the journal cannot say, more changed runs than were left, no
+/// snapshot; then the runs of the third.
+static UNMERGED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// [`UNMERGED`], taken.
+pub(crate) fn unmerged_stats() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| UNMERGED[i].swap(0, Ordering::Relaxed))
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -2047,6 +2057,7 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
+        crate::lines::wrote(start + at, now, held, crate::host::landing());
         if !merge_piece(now, held, title) {
             return 0;
         }
@@ -2260,8 +2271,12 @@ impl Shadow {
         if busy.is_empty() {
             return false;
         }
+        let unmerged = |why: usize| {
+            UNMERGED[why].fetch_add(1, Ordering::Relaxed);
+            true
+        };
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return unmerged(0);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
@@ -2273,7 +2288,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
+                return unmerged(1);
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2312,7 +2327,8 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
-                        return true;
+                        UNMERGED[4].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        return unmerged(2);
                     }
                     *runs_left -= runs.len();
                     for (r, m) in runs {
@@ -2323,7 +2339,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
-                        return true;
+                        return unmerged(3);
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
                     // bytes at the copy's offsets (`writing`), and these
@@ -2646,6 +2662,7 @@ impl Shadow {
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
+            crate::lines::wrote(start + at + a, &gpu[a..b], &held[a..b], crate::host::landing());
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);

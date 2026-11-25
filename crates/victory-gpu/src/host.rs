@@ -2105,6 +2105,70 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Every 32nd time a submission waits for what flights' shaders may write:
+/// which of its steps read that, and which declared ranges they touch.
+#[cfg(feature = "diagnostics")]
+fn note_blocked(line: &Line, runs: &[&HostList]) {
+    use std::fmt::Write;
+    static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !TIMES.fetch_add(1, Ordering::Relaxed).is_multiple_of(32) {
+        return;
+    }
+    let mut text = String::new();
+    let mut counts = [(0usize, 0usize); 4];
+    let mut named = 0;
+    for (n, list) in runs.iter().enumerate() {
+        for step in &list.deferred().copies {
+            let (kind, name, at, len) = match step {
+                &Step::Copy(dst, src, len) if read_waits(&line.written, src, len) => {
+                    _ = dst;
+                    (0, "copy from", src, len)
+                }
+                &Step::Copy(dst, _, len) => (1, "copy to", dst, len),
+                &Step::Fill(_, src, len) if read_waits(&line.written, src, len) => (2, "fill from", src, len),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    (3, "texture", at, len)
+                }
+                _ => continue,
+            };
+            if !touches(&line.written, at, at + len) {
+                continue;
+            }
+            counts[kind].0 += 1;
+            counts[kind].1 += len;
+            named += 1;
+            if named > 6 {
+                continue;
+            }
+            let _ = write!(text, "; list {n} of {} {name} {at:#x}+{len:#x}", runs.len());
+            for item in line.line.iter() {
+                let Late::Run(flight) = item else { continue };
+                for (_, ranges) in &flight.back {
+                    for &(from, to) in ranges {
+                        if from < at + len && at < to {
+                            let _ = write!(text, " [flight {} {from:#x}+{:#x}]", flight.number, to - from);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!("a submission waits for flights: copies from {:?}, copies to {:?}, fills {:?}, textures {:?} (number, bytes){text}", counts[0], counts[1], counts[2], counts[3]);
+}
+
+/// The first submission that has not landed ([`relay`]).
+pub(crate) fn landing() -> u64 {
+    FINISHED.load(Ordering::Relaxed) + 1
+}
+
+/// Whether a read of `[at, at + len)` waits for the flights that declared
+/// `written`.
+fn read_waits(written: &[(usize, usize)], at: usize, len: usize) -> bool {
+    touches(written, at, at + len)
+        && (!relay_exact() || crate::lines::written(at, len, STARTED.load(Ordering::Relaxed)))
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2116,7 +2180,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    if touches(written, dst, dst + len) || read_waits(written, src, len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2124,7 +2188,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if read_waits(written, src, len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2146,6 +2210,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         }
     }
     None
+}
+
+/// How many changed runs go up to copies in the card's memory beside
+/// flights' writes, for one submission (`VICTORY_MERGE_RUNS`, 512).
+fn merge_runs() -> usize {
+    static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(512))
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -2175,7 +2246,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        let mut runs_left = merge_runs();
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -2585,6 +2656,13 @@ fn late_line(frames: f64) {
             w[WHY_FENCE],
         );
     }
+    if crate::lines::on() {
+        let [ahead, missed] = crate::lines::taken().map(|n| n as f64 / frames);
+        tracing::info!(
+            "reads of title memory ahead of flights that declared it, per frame (VICTORY_READ_LEARN=1): {ahead:.0}, \
+             and {missed:.1} lines of 256 bytes that a flight then had written"
+        );
+    }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -2605,6 +2683,11 @@ fn late_line(frames: f64) {
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+        let [unwatched, unsaid, many, missing, over] = crate::shadow::unmerged_stats();
+        tracing::info!(
+            "flights settled because title bytes could not be put in so, in all: {unwatched} times not watched, {unsaid} the journal could not say, {many} more changed runs than VICTORY_MERGE_RUNS={} left ({over} runs in those pages), {missing} no snapshot",
+            merge_runs()
         );
     }
 }
@@ -4012,6 +4095,8 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
+            #[cfg(feature = "diagnostics")]
+            note_blocked(&line(), runs);
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
