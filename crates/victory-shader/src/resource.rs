@@ -234,7 +234,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -1118,8 +1118,9 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `site`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, site: Site) -> Result<Source, &'static str> {
+        let (at, i) = site;
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1127,8 +1128,15 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach the access read the descriptor.
+        // Only the lanes that run the access read the descriptor: those
+        // that reach it and, for a vector access, whose EXEC bit is set
+        // there (without its early-outs, a program's lanes that left early
+        // still reach later blocks and take branches that skip code for
+        // want of active lanes, past a store that sets the sampler).
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        if let Some(&Some(guard)) = self.lanes.and_then(|l| l.guards.get(at)?.get(i)) {
+            known.push((guard, true));
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -3853,5 +3861,39 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_sampler_set_where_lanes_run_is_what_the_sampling_lanes_hold() {
+        // A bounds test without its early-out: lanes outside it still walk
+        // on, and take the inner branch's skip (EXEC is empty for them), so
+        // the sampler is unset on that edge; but they do not sample.
+        let words = [
+            0xBEA8_047E, // s_mov_b64 s[40:41], exec
+            0x7D88_0400, // v_cmp_gt_u32 vcc, s0, v2
+            0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+            0xBEAB_0380, // s_mov_b32 s43, 0
+            0xF40C_0115,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[42:43], null
+            0xBE94_2428, // s_and_saveexec_b64 s[20:21], s[40:41]
+            0xBF88_0005, // s_cbranch_execz 0x30
+            0xB000_0092, // s_movk_i32 s0, 0x92
+            0xBE81_03FF,
+            0x00C0_0000, // s_mov_b32 s1, 0xc00000
+            0xBE82_0BA8, // s_brev_b32 s2, 40
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBEFE_0414, // 0x30: s_mov_b64 exec, s[20:21]
+            0xF090_0108,
+            0x0001_0707, // image_sample_l v7, v[7:9], s[4:11], s[0:3]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let r = track(&p, &[param(Table, 42, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+        assert_eq!(
+            sampler.source,
+            Source::Constant(vec![0x92, 0x00C0_0000, 0x1400_0000, 0])
+        );
     }
 }
