@@ -1691,7 +1691,18 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                // The same title memory says nothing of the host copy: the
+                // sweep (`resource::let_go_idle`) may have let it go and a
+                // use made it anew, empty, its staging state gone. Then it
+                // is uploaded again here (play1: skin, heads and a shirt
+                // that had loaded went black or see-through minutes later).
+                let still_staged = heap.handle(index).and_then(crate::descriptor::view).is_none_or(|v| {
+                    match crate::descriptor::host::placed_texture(&v).unwrap_or(v) {
+                        View::Shader(resource, _) => crate::texture::is_staged(resource as This),
+                        _ => true,
+                    }
+                });
+                if still_staged && crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
