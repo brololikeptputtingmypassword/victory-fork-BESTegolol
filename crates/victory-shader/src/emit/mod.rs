@@ -496,6 +496,28 @@ pub fn emit(
                 }
             }
         }
+        // `VICTORY_WAVE64_APPROX` (on unless `0`): a program no form above takes keeps
+        // 64-lane waves, which the host refuses, and its dispatches are dropped (the light
+        // and fog volume, 926c46bab3b86bd6). Last of all, the wave-wide branches even where
+        // `VICTORY_WAVE_WIDE` leaves them off: their group barriers in branches and loops
+        // are a risk taken only for programs that would otherwise not run at all.
+        let approx_on = std::env::var_os("VICTORY_WAVE64_APPROX").is_none_or(|v| v != "0");
+        if approx_on && !wide_on {
+            let deep = form(ir::without_skips(p, true));
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            for base in bases.into_iter().flatten() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // Cross-lane code where not every lane runs, on a host whose waves may be of any size:
     // once more with every lane there, where that is all it wants.
