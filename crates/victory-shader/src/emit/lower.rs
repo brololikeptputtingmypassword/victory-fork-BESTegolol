@@ -600,6 +600,18 @@ pub(super) fn lds_settled(p: &Program, site: (usize, usize)) -> bool {
     })
 }
 
+/// An LDS atomic on one dword (`ds_add_rtn_u32`, `ds_or_b32`...), not a read, write or lane move.
+fn lds_atomic(name: &str) -> bool {
+    name.starts_with("ds_")
+        && ["add_", "min_", "max_", "or_", "and_", "xor_"]
+            .iter()
+            .any(|op| name[3..].starts_with(op))
+        && !name.contains("_f32")
+        && !name.contains("_u64")
+        && !name.contains("_i64")
+        && !name.contains("_b64")
+}
+
 /// What a register value holds, for [`wave_local`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wave {
@@ -666,6 +678,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     // first lane's reservation.
     let step = |inst: &Inst,
                 kind: &HashMap<Value, Wave>,
+                under: &HashMap<Value, (Bool, Wave)>,
+                guard: Option<Bool>,
                 firsts: &mut HashSet<Value>|
      -> Result<(Wave, bool), Why> {
         let name = inst.name();
@@ -688,7 +702,14 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             {
                 data.iter().copied().collect()
             }
+            // an atomic on a counter in LDS: its operand (the address is checked below)
+            Fields::Ds { data, .. } if lds_atomic(name) => data.clone(),
             _ => Vec::new(),
+        };
+        // a value a guarded write merged: under that same guard, only its new part is read
+        let of = |kind: &HashMap<Value, Wave>, v: Option<Value>| match v.and_then(|v| under.get(&v)) {
+            Some(&(g, k)) if guard == Some(g) => k,
+            _ => of(kind, v),
         };
         let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
         // Everything else it reads (addresses, descriptors, SCC, the high dwords of wide
@@ -792,7 +813,23 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 }
             }
             // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
+            (_, [Wave::Total(op)]) if name.contains("_atomic_") || lds_atomic(name) => {
+                // (the LDS form: a counter the thread group shares, as the boat mission's
+                // water-tile list keeps, compute 6b82bc7d22016cb5)
+                let lds = |n: &str| {
+                    let base = n.strip_prefix("ds_").unwrap_or(n).replace("_rtn", "");
+                    match op {
+                        Op::AddU => base == "add_u32",
+                        Op::MinU => base == "min_u32",
+                        Op::MaxU => base == "max_u32",
+                        Op::MinI => base == "min_i32",
+                        Op::MaxI => base == "max_i32",
+                        Op::Or => base == "or_b32",
+                        Op::And => base == "and_b32",
+                        Op::Xor => base == "xor_b32",
+                        _ => false,
+                    }
+                };
                 let want = match op {
                     Op::AddU => "buffer_atomic_add",
                     Op::MinU => "buffer_atomic_umin",
@@ -804,7 +841,8 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                     Op::Xor => "buffer_atomic_xor",
                     _ => "",
                 };
-                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                let named = if lds_atomic(name) { lds(name) } else { name == want };
+                if !named || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
                     return Err(TOTAL);
                 }
                 reserved = true;
@@ -819,6 +857,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         .collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
     let pass = |kind: &mut HashMap<Value, Wave>,
+                under: &mut HashMap<Value, (Bool, Wave)>,
                 firsts: &mut HashSet<Value>,
                 check: bool|
      -> Result<(), (usize, Why)> {
@@ -874,9 +913,16 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if name.starts_with("s_cbranch") {
                     continue; // with the block's exit, below
                 }
-                let (k, reserved) = match step(inst, kind, firsts) {
+                let (k, reserved) = match step(inst, kind, under, st.guards[b][i], firsts) {
                     Ok(r) => r,
-                    Err(why) if check => return Err((inst.machine.offset, why)),
+                    Err(why) if check => {
+                        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                            for &(r, v) in &inst.reads {
+                                eprintln!("WAVE-LOCAL {:#x} reads {r:?} = {v:?}: {:?} guard {:?}", inst.machine.offset, of(kind, Some(v)), st.guards[b][i]);
+                            }
+                        }
+                        return Err((inst.machine.offset, why));
+                    }
                     Err(_) => (Wave::Mixed, false),
                 };
                 // the same test as `Lower::inst`'s `effect`
@@ -914,7 +960,12 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                             Wave::First | Wave::Total(_) | Wave::Prefix
                         )
                     {
+                        if let Some(g) = st.guards[b][i] {
+                            under.insert(w, (g, kw));
+                        }
                         kw = Wave::Mixed;
+                    } else {
+                        under.remove(&w);
                     }
                     put(kind, w, kw);
                 }
@@ -937,12 +988,13 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         Ok(())
     };
     let mut kind: HashMap<Value, Wave> = HashMap::new();
+    let mut under: HashMap<Value, (Bool, Wave)> = HashMap::new();
     let mut firsts: HashSet<Value> = HashSet::new();
     // to a fixpoint (values carried around loops), then once more to say what is wrong
     let mut settled = false;
     for _ in 0..16 {
         let before = (kind.clone(), firsts.len());
-        pass(&mut kind, &mut firsts, false)?;
+        pass(&mut kind, &mut under, &mut firsts, false)?;
         if (&before.0, before.1) == (&kind, firsts.len()) {
             settled = true;
             break;
@@ -951,7 +1003,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     if !settled {
         return Err((0, MIXED));
     }
-    pass(&mut kind, &mut firsts, true)
+    pass(&mut kind, &mut under, &mut firsts, true)
 }
 
 /// The mode of a group barrier the translation adds (host waves meeting):
@@ -1022,12 +1074,31 @@ fn lds_meetings(
     // lane, byte ranges)
     let mut accesses: Vec<Vec<LdsAccess>> = vec![Vec::new(); n];
     let same = lane_uniform(p, st, all);
+    // constants moved into VGPRs, with the guard of the move: the lanes it ran in hold them
+    let mut konst: HashMap<Value, (Option<Bool>, u32)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if let (Fields::Valu(v), "v_mov_b32") = (&inst.fields, inst.name())
+                && v.dpp.is_none()
+                && v.sdwa.is_none()
+                && let Some(Operand::Vector { reg, .. }) = v.dst
+                && let Some(w) = inst.write(Reg::V(reg))
+            {
+                let c = match v.src.first() {
+                    Some(&Operand::Const(c @ 128..=192)) => u32::from(c - 128),
+                    Some(&Operand::Literal(x)) => x,
+                    _ => continue,
+                };
+                konst.insert(w, (st.guards.get(b).and_then(|g| g.get(i)).copied().flatten(), c));
+            }
+        }
+    }
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
+        for (at, i) in block.insts.iter().enumerate() {
             let name = i.name();
             if !matches!(i.fields, Fields::Ds { .. })
                 || name.starts_with("ds_swizzle")
@@ -1040,7 +1111,14 @@ fn lds_meetings(
             } else {
                 writes[r] = true;
             }
-            accesses[r].push(lds_access(i, &same));
+            let mut a = lds_access(i, &same);
+            if let Fields::Ds { addr: Some(Operand::Vector { reg, .. }), .. } = &i.fields
+                && let Some(&(g, c)) = i.read(Reg::V(*reg)).and_then(|v| konst.get(&v))
+                && (g.is_none() || g == st.guards[b][at])
+            {
+                a.at = Some(c);
+            }
+            accesses[r].push(a);
         }
     }
     if let Some(r) = (0..n).find(|&r| reads[r] && writes[r] && !lds_region_ordered(&accesses[r])) {
@@ -1078,6 +1156,8 @@ struct LdsAccess {
     base: Option<Value>,
     /// Byte ranges past the address (start, end); `(0, u32::MAX)` where not known.
     ranges: Vec<(u32, u32)>,
+    /// The address, where it is a constant in the lanes that run the access.
+    at: Option<u32>,
 }
 
 fn lds_access(i: &Inst, same: &HashSet<Value>) -> LdsAccess {
@@ -1140,6 +1220,7 @@ fn lds_access(i: &Inst, same: &HashSet<Value>) -> LdsAccess {
         atomic,
         base,
         ranges,
+        at: None,
     }
 }
 
@@ -1151,21 +1232,42 @@ fn lds_access(i: &Inst, same: &HashSet<Value>) -> LdsAccess {
 /// - a read and a plain write, both at lane-uniform addresses: taken as a section one lane
 ///   runs (several lanes reading and then writing one dword race on the console too).
 ///
+/// - a read and a write whose bytes cannot meet: one at a constant address, the other at
+///   offsets past its end (an address register only adds to them).
+///
+/// A constant address counts as lane-uniform.
 /// shortcut: the second rule does not prove that only one lane gets there.
 fn lds_region_ordered(acc: &[LdsAccess]) -> bool {
+    let abs = |a: &LdsAccess| -> Vec<(u32, u32)> {
+        let k = a.at.unwrap_or(0);
+        a.ranges.iter().map(|&(s, e)| (s.saturating_add(k), e.saturating_add(k))).collect()
+    };
     let meet = |a: &LdsAccess, w: &LdsAccess| {
-        a.ranges
-            .iter()
-            .any(|&(s0, e0)| w.ranges.iter().any(|&(s1, e1)| s0 < e1 && s1 < e0))
+        let (a, w) = (abs(a), abs(w));
+        a.iter()
+            .any(|&(s0, e0)| w.iter().any(|&(s1, e1)| s0 < e1 && s1 < e0))
+    };
+    // `a` at a constant address ends before the lowest byte `b` can reach
+    let below = |a: &LdsAccess, b: &LdsAccess| {
+        a.at.is_some()
+            && abs(a).iter().map(|r| r.1).max().unwrap_or(u32::MAX)
+                <= abs(b).iter().map(|r| r.0).min().unwrap_or(0)
+    };
+    let uniform = |a: &LdsAccess| a.base.is_some() || a.at.is_some();
+    let same_base = |r: &LdsAccess, w: &LdsAccess| match (r.at, w.at) {
+        (Some(_), Some(_)) => true,
+        _ => r.base.is_some() && r.base == w.base && r.at.is_none() && w.at.is_none(),
     };
     acc.iter().filter(|a| a.read).all(|r| {
-        acc.iter()
-            .filter(|w| !w.read)
-            .all(|w| match (r.base, w.base) {
-                (Some(x), Some(y)) if w.atomic => x == y && !meet(r, w),
-                (Some(_), Some(_)) => true,
-                _ => false,
-            })
+        acc.iter().filter(|w| !w.read).all(|w| {
+            below(r, w)
+                || below(w, r)
+                || if w.atomic {
+                    same_base(r, w) && !meet(r, w)
+                } else {
+                    uniform(r) && uniform(w)
+                }
+        })
     })
 }
 
@@ -1624,7 +1726,11 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                // (each host wave on its own exchanges nothing: no dwords, which
+                                // a program using all 32 KB has no room for)
+                                if !LOCAL_WAVES.get() {
+                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1672,7 +1778,10 @@ impl<'a> Lower<'a> {
                     );
                 }
             }
-            if wave == 32 && x.native.wave64 {
+            // A one-row group (x, 1, 1) whose LDS is full: its flat ids are its x, which the
+            // host's waves take in runs of 32 as they come, so no counter is needed for them.
+            let full_row = cs.threads[1] == 1 && cs.threads[2] == 1 && s.lds_dwords >= 8192;
+            if wave == 32 && x.native.wave64 && !full_row {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
