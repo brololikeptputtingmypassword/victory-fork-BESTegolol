@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -370,6 +370,52 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// The same views by what they show: their section, their length's class
+    /// (its power of two, in pages), their first page in it, their address.
+    shown: BTreeSet<(usize, u32, usize, usize)>,
+}
+
+impl Physical {
+    /// A view's entry in [`Physical::shown`].
+    fn shown_as(at: usize, len: usize, slice: &Slice) -> (usize, u32, usize, usize) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        (section, (len / PAGE).max(1).ilog2(), slice.index, at)
+    }
+
+    /// The ranges of title memory that show `n` pages from `slice`'s.
+    fn showing(&self, slice: &Slice, n: usize) -> Vec<(usize, usize)> {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        let (start, end) = (slice.index, slice.index + n);
+        let mut found = Vec::new();
+        for class in 0..usize::BITS - PAGE.ilog2() {
+            let reach = 1usize << (class + 1);
+            let from = (section, class, start.saturating_sub(reach), 0);
+            for &(_, _, first, at) in self.shown.range(from..(section, class, end, 0)) {
+                let pages = self.views.get(&at).map_or(0, |v| v.0 / PAGE);
+                let (a, b) = (start.max(first), end.min(first + pages));
+                if a < b {
+                    found.push((at + (a - first) * PAGE, (b - a) * PAGE));
+                }
+            }
+        }
+        found
+    }
+}
+
+/// DirectStorage has filled bytes `[offset, offset + len)` of physical pages
+/// through a view of its own, which the GPU side's guards do not see: it is
+/// told of them wherever the title has the pages mapped.
+pub(crate) fn filled(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let shown: Vec<(usize, usize)> = {
+        let physical = physical();
+        runs.iter().flat_map(|(slice, n)| physical.showing(slice, *n)).collect()
+    };
+    for (at, len) in shown {
+        victory_gpu::title_memory_filled(at, len);
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -746,6 +792,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.shown.insert(Physical::shown_as(base, len, &slice));
     physical.views.insert(base, (len, slice));
     true
 }
@@ -824,6 +871,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        physical.shown.remove(&Physical::shown_as(at, size, &slice));
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1256,6 +1304,36 @@ mod tests {
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
+    }
+
+    #[test]
+    fn pages_know_where_they_show() {
+        let pages = allocate(5);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 8 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |k: usize| (a as usize + k * PAGE) as *mut c_void;
+        let showing = |k: usize, n: usize| {
+            let physical = physical();
+            let slice = physical.pages[&pages[k]].clone();
+            let mut found = physical.showing(&slice, n);
+            found.sort();
+            found.into_iter().map(|(v, len)| ((v - a as usize) / PAGE, len / PAGE)).collect::<Vec<_>>()
+        };
+        assert_eq!(showing(0, 5), []);
+        // Pages 0..5 at 0, and page 1 again at 6.
+        assert_eq!(XMemMapPhysicalPages(a, 5, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(at(6), 1, pages[1..].as_ptr()), at(6));
+        assert_eq!(showing(0, 5), [(0, 5), (6, 1)]);
+        assert_eq!(showing(1, 1), [(1, 1), (6, 1)]);
+        assert_eq!(showing(4, 1), [(4, 1)]);
+        // Cut in two at page 2.
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, std::ptr::null()), at(2));
+        assert_eq!(showing(0, 5), [(0, 2), (3, 2), (6, 1)]);
+        assert_eq!(showing(2, 1), []);
+        assert_eq!(XMemMapPhysicalPages(a, 8, std::ptr::null()), a);
+        assert_eq!(showing(0, 5), []);
+        assert!(!physical().shown.iter().any(|s| s.3 >= a as usize && s.3 < a as usize + 8 * PAGE));
+        assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
     }
 
     #[test]

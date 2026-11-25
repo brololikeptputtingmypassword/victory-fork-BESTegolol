@@ -739,6 +739,12 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// The runtime has written title memory `[at, at + len)`, all of it by now:
+/// the placed textures there changed with no descriptor written.
+pub fn title_memory_filled(at: usize, len: usize) {
+    crate::descriptor::host::remapped(at, len);
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///

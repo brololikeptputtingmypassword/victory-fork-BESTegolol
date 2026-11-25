@@ -947,6 +947,27 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
+/// `ERROR_INVALID_USER_BUFFER` and `ERROR_NOACCESS`: the kernel could not
+/// write the caller's buffer.
+const INVALID_USER_BUFFER: i32 = 1784;
+const NOACCESS: i32 = 998;
+
+/// Times a read is tried again that the kernel could not write in place.
+const READ_AGAIN: u32 = 64;
+
+fn read_again() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_AGAIN").is_none_or(|v| v != "0"))
+}
+
+/// Whether the GPU side is told of a destination once it is filled, so that
+/// a texture uploaded before its bytes came is uploaded again at once
+/// (`VICTORY_FILL_NOTIFY=0`: when its slot is next looked at).
+fn notify() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_NOTIFY").is_none_or(|v| v != "0"))
+}
+
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -959,7 +980,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .state
         .file;
     let started = std::time::Instant::now();
-    let mut done = 0;
+    let (mut done, mut again) = (0, 0);
     let result = loop {
         if done == out.len() {
             break Ok(());
@@ -967,6 +988,25 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
+            // The GPU side guarded the pages again between the opening of
+            // them (`into_destination`) and the kernel's write, which fails
+            // there instead of faulting into its handler: the read is lost,
+            // and the title never asks again (a boot died of two). Opened
+            // again and read again (`VICTORY_READ_AGAIN=0`: lost).
+            Err(error)
+                if again < READ_AGAIN
+                    && read_again()
+                    && matches!(error.raw_os_error(), Some(INVALID_USER_BUFFER | NOACCESS)) =>
+            {
+                again += 1;
+                let rest = &out[done..];
+                victory_gpu::kernel_will_write(rest.as_ptr() as usize, rest.len());
+                static TIMES: AtomicU64 = AtomicU64::new(0);
+                let times = TIMES.fetch_add(1, Ordering::Relaxed) + 1;
+                if times <= 20 || times.is_multiple_of(1000) {
+                    tracing::warn!(times, again, len = rest.len(), "dstorage: a read met a guarded page: opened and read again");
+                }
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };
@@ -991,7 +1031,11 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let filled = fill(out).map(drop);
+        if notify() {
+            victory_gpu::title_memory_filled(request.destination as usize, len);
+        }
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -1005,7 +1049,11 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let filled = fill(window.bytes()).map(drop);
+        if notify() {
+            super::xmem::filled(pages, offset, len);
+        }
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1025,6 +1073,9 @@ fn into_destination(
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
     if written {
+        if notify() {
+            super::xmem::filled(pages, offset, n);
+        }
         if tries > 0 {
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
