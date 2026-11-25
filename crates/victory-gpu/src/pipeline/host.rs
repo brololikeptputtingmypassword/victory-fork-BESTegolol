@@ -208,6 +208,30 @@ impl GraphicsState {
         )
     }
 
+    /// The blend description the host takes: no blending into integer
+    /// targets. The console ignores blending there; D3D12 refuses such a
+    /// pipeline (`E_INVALIDARG`). A title's blend without independent
+    /// blending gives every target the first target's blend, so a pixel
+    /// shader writing a `uint` target beside blended colour (mesh
+    /// f5e50eb2108c425b with pixel ce3f0432a08f1d35) got no pipeline.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |i: usize| is_integer(self.targets.RTFormats[i]);
+        if !(0..n).any(|i| integer(i) && blend_on(&blend, i)) {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            blend.IndependentBlendEnable = true.into();
+            let first = blend.RenderTarget[0];
+            blend.RenderTarget.iter_mut().for_each(|rt| *rt = first);
+        }
+        for i in (0..n).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -248,6 +272,41 @@ pub(crate) struct Input {
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+}
+
+/// Whether target `i` of `blend` blends (without independent blending,
+/// every target blends as the first does).
+fn blend_on(blend: &D3D12_BLEND_DESC, i: usize) -> bool {
+    let i = if blend.IndependentBlendEnable.as_bool() { i } else { 0 };
+    blend.RenderTarget[i].BlendEnable.as_bool()
+}
+
+/// An integer render target format (no blending on the host).
+fn is_integer(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
 }
 
 /// The console's own primitive topology types.
@@ -560,7 +619,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -605,7 +664,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -663,7 +722,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, state, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
@@ -761,7 +820,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -849,6 +908,29 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// A title blend without independent blending reaches an integer
+    /// target too: the host keeps the colour target's blend and leaves the
+    /// integer one unblended.
+    #[test]
+    fn no_blending_into_integer_targets() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R32_UINT;
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        let b = g.host_blend();
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool() && b.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        // nothing to change: the title's own description
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        assert!(!g.host_blend().IndependentBlendEnable.as_bool());
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
