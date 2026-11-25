@@ -240,6 +240,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The thread count in x of the dispatch being bound, when the title
+    /// sized it in threads ([`State::dispatch_threads`]).
+    threads: Option<u32>,
 }
 
 impl Drop for State {
@@ -424,6 +427,20 @@ fn dropped(pipeline: usize) {
 
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// The copy a root view at `a` binds: the rest of its 4 MiB cell, or with
+/// `span` one sized copy from `a` over up to that many bytes of committed
+/// title memory ([`crate::pipeline::builder_view_span`]).
+fn view_copy(span: Option<u64>, a: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let Some(most) = span else {
+        return crate::shadow::find(a, 1);
+    };
+    let mut len = 0u64;
+    while len < most && crate::texture::committed((a + len) as *const u8, 1 << 16) {
+        len += 1 << 16;
+    }
+    crate::shadow::find(a, len.max(1))
+}
 
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
@@ -750,9 +767,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_MEMORY_BASE, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_THREAD_LIMIT {
+            return self.threads.unwrap_or(u32::MAX);
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -779,7 +801,23 @@ impl State {
             _ => 0,
         };
         if address == 0 {
-            once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
+            // Once per program (the first 20), with what the table holds there.
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let hash = crate::pipeline::first_hash(self.pipeline as This).unwrap_or_default();
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 20 && !seen.contains(&hash) {
+                let root = match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(Root::Table(table)) => format!(
+                        "table {table:#x}, descriptor there {}",
+                        crate::descriptor::view(table + u64::from(dword) * 4).is_some()
+                    ),
+                    Some(Root::View(a)) => format!("a root view {a:#x}"),
+                    Some(_) => "another root".to_owned(),
+                    None => "nothing".to_owned(),
+                };
+                tracing::warn!(slot, dword, hash, root, builder = crate::pipeline::is_builder(self.pipeline as This), "a shader takes the address of a buffer view that is not there: it reads 0");
+                seen.push(hash);
+            }
         }
         if kind == USER_VIEW_ADDRESS {
             address as u32
@@ -1161,8 +1199,9 @@ impl State {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map_or(u64::MAX, |mb| mb << 20)
         });
+        let span = crate::pipeline::builder_view_span(self.pipeline as This);
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+            let s = view_copy(span, a)?;
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1904,7 +1943,73 @@ impl State {
         });
     }
 
+    /// `VICTORY_BVH_TRACE=<hash prefix>` (diagnostics): the first 60
+    /// dispatches of builder programs whose shader hash starts so are
+    /// logged with their roots and the copy each root view lands in.
+    #[cfg(feature = "diagnostics")]
+    fn trace_builder(&self, what: &str) {
+        use std::fmt::Write;
+        static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        static LEFT: AtomicU64 = AtomicU64::new(60);
+        let Some(prefix) = PREFIX.get_or_init(|| std::env::var("VICTORY_BVH_TRACE").ok()) else {
+            return;
+        };
+        if !crate::pipeline::is_builder(self.pipeline as This) {
+            return;
+        }
+        let Some(hash) = crate::pipeline::first_hash(self.pipeline as This) else {
+            return;
+        };
+        if !hash.starts_with(prefix.as_str())
+            || LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_err()
+        {
+            return;
+        }
+        let mut text = String::new();
+        for (slot, root) in self.compute.iter().enumerate() {
+            match root {
+                Root::None => {}
+                Root::Table(a) => {
+                    let _ = write!(text, " {slot}=table {a:#x}");
+                }
+                Root::Constants(v) => {
+                    let _ = write!(text, " {slot}=constants {:x?}", &v[..v.len().min(24)]);
+                }
+                Root::View(a) => {
+                    let _ = write!(text, " {slot}=view {a:#x}");
+                    match view_copy(crate::pipeline::builder_view_span(self.pipeline as This), *a) {
+                        Some(s) => {
+                            let (start, len) = s.span();
+                            let mut c = 0u64;
+                            while c < (64 << 20) && crate::texture::committed((*a + c) as *const u8, 1 << 16) {
+                                c += 1 << 16;
+                            }
+                            let _ = write!(text, " copy {start:#x}+{len:#x} left {:#x} committed {c:#x}", s.left(*a));
+                        }
+                        None => text.push_str(" no copy"),
+                    }
+                }
+            }
+        }
+        tracing::info!(hash = %hash, frame = crate::frame::current(), "builder trace: {what}:{text}");
+    }
+
     /// Runs a dispatch on the host.
+    /// A dispatch whose size is in threads (`DispatchX` with the console's
+    /// `USE_THREAD_DIMENSIONS`, bit 5: the structure builder's): as many
+    /// groups as cover them.
+    /// The console starts a last, partial group with only the threads
+    /// left; the builder's programs clear EXEC for the lanes past `x`
+    /// themselves (`victory_shader::spill::partial_prologue`, which reads
+    /// it as the host word `USER_THREAD_LIMIT`).
+    /// shortcut: only in x; a partial group in y or z runs whole.
+    pub(crate) fn dispatch_threads(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let g = crate::pipeline::group_size(self.pipeline as This);
+        self.threads = Some(x);
+        self.dispatch(list, x.div_ceil(g[0]), y.div_ceil(g[1]), z.div_ceil(g[2]));
+        self.threads = None;
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
@@ -1962,6 +2067,15 @@ impl State {
         let _sp3 = crate::copystat::Span::new();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        if crate::pipeline::builder_dry(self.pipeline as This) {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        self.trace_builder(&format!("dispatch {x}x{y}x{z}"));
+        if crate::pipeline::builder_barrier(self.pipeline as This) {
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2771,6 +2885,27 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        if kind == DISPATCH && crate::pipeline::is_builder(self.pipeline as This) {
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let hash = crate::pipeline::first_hash(self.pipeline as This).unwrap_or_default();
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&hash) {
+                tracing::info!(hash, max, stride, "a builder program dispatched indirectly");
+                seen.push(hash);
+            }
+        }
+        if kind == DISPATCH && crate::pipeline::builder_dry(self.pipeline as This) {
+            crate::indirect::done(list, &bounded);
+            return true;
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.trace_builder(&format!("indirect max {max} at {arguments:#x}"));
+        }
+        if kind == DISPATCH && crate::pipeline::builder_barrier(self.pipeline as This) {
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }

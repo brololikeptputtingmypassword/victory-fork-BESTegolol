@@ -83,6 +83,23 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// `VICTORY_MEMORY_FAULT_MAP=0` (diagnostics; 1, the default, as before):
+/// pages shaders touched without a copy are not given one afterwards, so an
+/// access through a pointer nothing named stays lost (a read gives 0, a
+/// store is dropped) instead of reaching that memory from the next frame
+/// on. For the structure builder, whose first frames compute addresses from
+/// zeros read where its address table had no copy yet: with the pages it
+/// then touched given copies, its later stores landed on the title's own
+/// objects (hbq1 2026-11-25: 1188 pages faulted, title pointers became
+/// 0xffffffff patterns within 7 s; with its dispatches bound but not run,
+/// VICTORY_BVH_DRY=1, no faults and no crash). Those pages came from
+/// dispatches 64 times too large (`list.rs` `dispatch_x`); with that fixed
+/// the default is kept.
+fn fault_map() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MEMORY_FAULT_MAP").map_or(true, |v| v != "0"))
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -213,12 +230,20 @@ impl Memory {
             // Each is an access that read 0 or was dropped.
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                let (low, high) = (pages.iter().min().copied().unwrap_or(0), pages.iter().max().copied().unwrap_or(0));
                 tracing::warn!(
                     pages = pages.len(),
                     first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
+                    low = format_args!("{:#x}", u64::from(low) * PAGE),
+                    high = format_args!("{:#x}", u64::from(high) * PAGE),
+                    copies = self.copies.len(),
+                    mapped = fault_map(),
                     "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
                 );
             }
+        }
+        if !fault_map() {
+            return;
         }
         for page in pages {
             self.map(u64::from(page) * PAGE);

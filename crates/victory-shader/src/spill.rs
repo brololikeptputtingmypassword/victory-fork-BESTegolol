@@ -27,7 +27,11 @@ const FIRST: u32 = 16;
 /// [`ir::build`] of `native`'s code as the hardware runs it, with the loads
 /// of a spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
-    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let mut code = native.patched_code();
+    if let Some((_, words)) = partial_prologue(native) {
+        code.splice(0..0, words.iter().flat_map(|w| w.to_le_bytes()));
+    }
+    let mut p = ir::build(&code, native.wave64, native.vgprs)?;
     user_data(&mut p, native);
     Ok(p)
 }
@@ -52,6 +56,43 @@ fn spilled(native: &NativeProgram) -> Option<Vec<(u32, u32)>> {
         .collect();
     // Only the one arrangement seen: the table starts at index 16.
     (spilled.iter().map(|e| e.0).min() == Some(FIRST) && registers >= 2).then_some(spilled)
+}
+
+/// The instructions to run first in a structure-builder program, and the
+/// SGPR they read the dispatch's thread count from (input
+/// [`ThreadLimit`](crate::io::Input::ThreadLimit)).
+///
+/// The builder sizes its dispatches in threads (`DispatchX` with
+/// `USE_THREAD_DIMENSIONS`), and the console starts the last group with
+/// only the threads left: 1606 threads of 64 are 25 full groups and one of
+/// 6 lanes. Its programs depend on that (`s_bcnt1_i32_b64 s26, exec` at
+/// entry lays out each group's block of LDS and memory), so a last group
+/// of 64 lanes misreads its data. The prologue clears EXEC for the lanes
+/// past the count: `v_lshl_add_u32 vT, s_tgid_x, log2(threads), v0`, then
+/// `v_cmpx_gt_u32 exec, s_limit, vT`. `vT` is the first VGPR after the
+/// thread ids, which the hardware leaves undefined.
+///
+/// `None` unless the program is spilled ([`is_spilled`]), one-dimensional
+/// with a power-of-two group, and has the x group id.
+pub fn partial_prologue(native: &NativeProgram) -> Option<(u8, [u32; 3])> {
+    let StageIo::Cs(cs) = &native.io else {
+        return None;
+    };
+    let [x, 1, 1] = cs.threads else {
+        return None;
+    };
+    let tgid = cs.system_sgprs().0[0]?;
+    let vt = u32::from(cs.thread_id_vgprs());
+    if !is_spilled(native) || !x.is_power_of_two() || x > 1024 || vt >= native.vgprs.into() {
+        return None;
+    }
+    let limit = cs.initialized_sgprs();
+    let lshl_add = [
+        0xD746_0000 | vt,
+        u32::from(tgid) | (0x80 + x.trailing_zeros()) << 9 | 0x100 << 18,
+    ];
+    let cmpx = 0x7C00_0000 | 0xD4 << 17 | vt << 9 | u32::from(limit);
+    Some((limit, [lshl_add[0], lshl_add[1], cmpx]))
 }
 
 /// Whether `native` reads its root parameters from a spilled user-data

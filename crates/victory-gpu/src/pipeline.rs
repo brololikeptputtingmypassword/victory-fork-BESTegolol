@@ -299,18 +299,35 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
-fn of_builder(shaders: &[Arc<Shader>]) -> bool {
+/// Also the program's thread-group size (a `DispatchX` may give its size
+/// in threads).
+fn of_builder(shaders: &[Arc<Shader>]) -> (bool, [u32; 3]) {
     use victory_shader::{Container, FourCC};
-    let [shader] = shaders else { return false };
+    let no = (false, [1; 3]);
+    let [shader] = shaders else { return no };
     if shader.stage != "compute" {
-        return false;
+        return no;
     }
     let Ok(c) = Container::parse(&shader.container) else {
-        return false;
+        return no;
     };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    let Some(programs) = c.part(FourCC::DXIL).and_then(|part| victory_shader::native_programs(part.data).ok()) else {
+        return no;
+    };
+    let threads = programs
+        .iter()
+        .find_map(|p| match &p.io {
+            victory_shader::native::StageIo::Cs(cs) => Some(cs.threads.map(|t| t.max(1))),
+            _ => None,
+        })
+        .unwrap_or([1; 3]);
+    (programs.iter().any(victory_shader::spill::is_spilled), threads)
+}
+
+/// The thread-group size of compute pipeline `this` ([1, 1, 1] for others).
+#[cfg(windows)]
+pub(crate) fn group_size(this: This) -> [u32; 3] {
+    if this.is_null() { [1; 3] } else { pipeline(this).group }
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -325,6 +342,77 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_BVH_VIEW_MB=<n>` (experiment, off): the builder's root views
+/// are given one copy from their address over up to `n` MiB of committed
+/// title memory, instead of the rest of their 4 MiB cell. Its stages work
+/// in place on structures of their dispatch's groups times 8 KiB (13 MB for
+/// 1606 groups, htr2 2026-11-25), and a view cut at its cell's end drops
+/// the stores past it and reads zeros there.
+pub(crate) fn builder_view_span(this: This) -> Option<u64> {
+    static MB: OnceLock<Option<u64>> = OnceLock::new();
+    let mb = (*MB.get_or_init(|| std::env::var("VICTORY_BVH_VIEW_MB").ok().and_then(|v| v.trim().parse().ok())))?;
+    (mb > 0 && is_builder(this)).then_some(mb << 20)
+}
+
+/// The hash of a pipeline's first shader (diagnostics).
+pub(crate) fn first_hash(this: This) -> Option<String> {
+    pipeline(this).shaders.first().map(|s| s.hash.clone())
+}
+
+/// `VICTORY_BVH_BARRIER=1` (diagnostics, off): with the builder on, an
+/// unordered access barrier on every resource before each of its
+/// dispatches, so a stage reads what the one before it stored (the title's
+/// barriers between them name structures in no buffer object, which the
+/// host may not turn into one).
+#[cfg(windows)]
+pub(crate) fn builder_barrier(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BARRIER").is_some_and(|v| v == "1")) && is_builder(this)
+}
+
+/// `VICTORY_BVH_DRY=1` (diagnostics, off): with the builder on, its
+/// dispatches are bound and their memory made ready as usual (copies
+/// numbered, brought up to date, declared written) but not run on the card.
+/// Tells a crash that comes from what its stages store apart from one that
+/// comes from the host's work around them or from the title going on to
+/// what follows a build.
+///
+/// `VICTORY_BVH_RUN_FIRST=N` (diagnostics): only the first `N` builder
+/// programs in the order of their first dispatch run (by shader hash, the
+/// order is logged), the others as with `VICTORY_BVH_DRY`: a bisection of
+/// the stages for the one whose stores reach the title's objects.
+#[cfg(windows)]
+pub(crate) fn builder_dry(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static FIRST: OnceLock<Option<usize>> = OnceLock::new();
+    static ORDER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    if !is_builder(this) {
+        return false;
+    }
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_DRY").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    let Some(first) = *FIRST.get_or_init(|| std::env::var("VICTORY_BVH_RUN_FIRST").ok().and_then(|v| v.trim().parse().ok()))
+    else {
+        return false;
+    };
+    let p = pipeline(this);
+    let Some(hash) = p.shaders.first().map(|s| s.hash.clone()) else {
+        return false;
+    };
+    let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let at = match order.iter().position(|h| *h == hash) {
+        Some(at) => at,
+        None => {
+            order.push(hash.clone());
+            let at = order.len() - 1;
+            tracing::info!(at, hash = %hash, runs = at < first, frame = crate::frame::current(), "a builder program's first dispatch");
+            at
+        }
+    };
+    at >= first
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -420,6 +508,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A compute program's thread-group size.
+    #[cfg(windows)]
+    group: [u32; 3],
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -570,7 +661,7 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
-    let builder = of_builder(&shaders);
+    let (builder, group) = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -585,6 +676,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        group,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

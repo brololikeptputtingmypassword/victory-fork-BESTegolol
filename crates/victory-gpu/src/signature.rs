@@ -56,7 +56,11 @@ pub(crate) extern "system" fn create(
         // SAFETY: the title passes `count` argument descriptions.
         unsafe { std::slice::from_raw_parts(desc.arguments, desc.count as usize) }.to_vec()
     };
-    tracing::debug!(stride = desc.stride, ?arguments, "command signature");
+    if arguments.iter().any(|a| a[0] == 105) {
+        tracing::info!(stride = desc.stride, ?arguments, "command signature with the console's single-pass dispatch");
+    } else {
+        tracing::debug!(stride = desc.stride, ?arguments, "command signature");
+    }
     let signature = Box::new(Signature {
         object: Object::new(&FUNCTIONS),
         stride: desc.stride,

@@ -70,6 +70,11 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Compute, a structure-builder program dispatched in threads: the
+    /// dispatch's thread count in x, which the prologue
+    /// [`spill::partial_prologue`](crate::spill::partial_prologue) compares
+    /// each lane's global id with.
+    ThreadLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +245,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
             }
             loaded.extend(info.map(|s| (Reg::S(s), Input::GroupInfo)));
+            if let Some((s, _)) = crate::spill::partial_prologue(native) {
+                loaded.push((Reg::S(s), Input::ThreadLimit));
+            }
             (loaded, &[][..], &[][..])
         }
         (StageIo::Ms(ms), HwStage::Ms) => {

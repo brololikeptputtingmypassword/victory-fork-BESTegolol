@@ -2615,6 +2615,10 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::ThreadLimit => {
+                use super::shader::USER_THREAD_LIMIT;
+                return Val::I32(self.host_word(RootType::Other(USER_THREAD_LIMIT), 0, 0));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()

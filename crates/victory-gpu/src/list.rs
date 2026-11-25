@@ -1316,14 +1316,43 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `USE_THREAD_DIMENSIONS`: the sizes are in threads, not groups.
+const THREAD_DIMENSIONS: u32 = 1 << 5;
+
+/// `VICTORY_DISPATCHX_GROUPS=1`: take the sizes for groups whatever the
+/// flags say (as before; a check).
+#[cfg(windows)]
+fn threads_as_groups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCHX_GROUPS").is_some_and(|v| v == "1"))
+}
+
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, the bits of
+/// `COMPUTE_DISPATCH_INITIATOR` (the ray-tracing builder dispatches this
+/// way, with 0x20 and 0x8020: sizes in threads, and wave32). Taking its
+/// thread counts for group counts ran 64 times its groups, and its stores
+/// past the end of its buffer broke the title (the crash ~40 s into the
+/// title with VICTORY_BVH_BUILDER=1).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    {
+        // Each distinct flags value once, with the first dispatch's size.
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 32 && !seen.contains(&flags) {
+            seen.push(flags);
+            tracing::info!(flags = format_args!("{flags:#x}"), x, y, z, "DispatchX flags");
+        }
+    }
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if flags & THREAD_DIMENSIONS != 0 && !threads_as_groups() {
+        state::dispatch_threads(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1396,10 +1425,32 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. A host list does
+/// not order shader stores between its dispatches by itself: a sync is an
+/// unordered access barrier on every resource there (the title's structure
+/// builder may separate its stages with these alone).
+/// Submissions are waited for anyway. Only with `VICTORY_SYNC_BARRIER=1`
+/// (off: a barrier before every builder dispatch, VICTORY_BVH_BARRIER=1,
+/// did not stop its crash, hbar1); without it nothing, as before.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_some_and(|v| v == "1"))
+            && let Some(list) = host_list(this)
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForSyncs, 1);
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1583,6 +1634,10 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    pub(super) fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch_threads(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
