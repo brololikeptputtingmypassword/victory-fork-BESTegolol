@@ -168,6 +168,19 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Lets go of the shared table `key` at `first` of the host heap behind the
+/// title heap at `heap`, if that heap still exists.
+#[cfg(windows)]
+pub(crate) fn drop_shared(heap: usize, key: host::TableKey, first: u32) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if heaps.iter().any(|&(_, _, h)| h == heap)
+        // SAFETY: registered heaps are live (removed when dropped).
+        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+    {
+        host.shared_drop(key, first);
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

@@ -49,6 +49,9 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
+    /// Tables made in dynamic slots that lists share (no constants in
+    /// them): the same table and contents is made once, not once per list.
+    shared: Mutex<SharedTables>,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -631,6 +634,7 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            shared: Mutex::default(),
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -713,10 +717,126 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A table's key: (table, slot count, hash of its contents).
+pub(crate) type TableKey = (u64, u32, u64);
+
+/// Frames a shared table is handed out for after it was made: a texture
+/// the title frees and makes again at the same address with the same
+/// record words would otherwise be read through the old view for good.
+const SHARED_FRAMES: u64 = 8;
+
+/// Tables lists share: key → (first, count, lists holding it, frame made);
+/// ones aged out but still held: (first, count, lists holding it).
+#[derive(Default)]
+struct SharedTables {
+    map: std::collections::HashMap<TableKey, (u32, u32, u32, u64)>,
+    gone: Vec<(u32, u32, u32)>,
+}
+
+/// Counts shared tables made and taken; logs at powers of two of those made.
+fn shared_count(made: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    if made {
+        let m = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        if m.is_power_of_two() && m >= 1024 {
+            tracing::info!(made = m, taken = TAKEN.load(Ordering::Relaxed), "shared tables");
+        }
+    } else {
+        TAKEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Shared tables on unless `VICTORY_SHARED_TABLES=0`.
+pub(crate) fn shared_tables_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("VICTORY_SHARED_TABLES").map_or(true, |v| v != "0"));
+    *ON
+}
+
 impl HostHeap {
+    /// The first slot of the shared table `key`, now held by one more list
+    /// (given back with [`HostHeap::shared_drop`]).
+    pub(crate) fn shared_take(&self, key: TableKey) -> Option<u32> {
+        let now = crate::frame::current();
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let &mut (first, n, refs, made) = s.map.get_mut(&key)?;
+        if made + SHARED_FRAMES < now {
+            s.map.remove(&key);
+            if refs == 0 {
+                drop(s);
+                self.release(first, n);
+            } else {
+                s.gone.push((first, n, refs));
+            }
+            return None;
+        }
+        s.map.get_mut(&key)?.2 = refs + 1;
+        shared_count(false);
+        Some(first)
+    }
+
+    /// `first..first + n` (taken by one list) now holds the shared table `key`.
+    pub(crate) fn shared_add(&self, key: TableKey, first: u32, n: u32) {
+        shared_count(true);
+        let now = crate::frame::current();
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((old, on, refs, _)) = s.map.insert(key, (first, n, 1, now)) {
+            if refs == 0 {
+                drop(s);
+                self.release(old, on);
+            } else {
+                s.gone.push((old, on, refs));
+            }
+        }
+    }
+
+    /// A list that held the shared table `key` at `first` has run.
+    pub(crate) fn shared_drop(&self, key: TableKey, first: u32) {
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = s.map.get_mut(&key)
+            && e.0 == first
+        {
+            e.2 = e.2.saturating_sub(1);
+            return;
+        }
+        if let Some(at) = s.gone.iter().position(|g| g.0 == first) {
+            s.gone[at].2 -= 1;
+            if s.gone[at].2 == 0 {
+                let (first, n, _) = s.gone.swap_remove(at);
+                drop(s);
+                self.release(first, n);
+            }
+        }
+    }
+
+    /// Gives back the shared tables no list holds: whether any were.
+    fn shared_evict(&self) -> bool {
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut free = Vec::new();
+        s.map.retain(|_, &mut (first, n, refs, _)| {
+            if refs == 0 {
+                free.push((first, n));
+            }
+            refs != 0
+        });
+        drop(s);
+        for &(first, n) in &free {
+            self.release(first, n);
+        }
+        !free.is_empty()
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// [`HostHeap::release`]: the first's index. Shared tables no list
+    /// holds are given back to find them if need be.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.dynamic_once(n)
+            .or_else(|| self.shared_evict().then(|| self.dynamic_once(n)).flatten())
+    }
+
+    fn dynamic_once(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
@@ -1080,10 +1200,16 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        #[cfg(feature = "diagnostics")]
+        let sp = crate::copystat::Span::new();
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        #[cfg(feature = "diagnostics")]
+        drop(sp);
+        #[cfg(feature = "diagnostics")]
+        let _sp = crate::copystat::Span::new();
         self.keep(index, kept.flatten());
     }
 
@@ -1833,6 +1959,107 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Texture views made once and copied after: creating a view is the
+/// largest part of making descriptor tables afresh (runs hitch5-6: about
+/// 85 ms a loading frame in `make_at`), and the title's tables name the
+/// same textures with the same views over and over. Keyed by the host
+/// texture and the title's view words; each entry holds the texture, so
+/// its address is not reused while cached. `VICTORY_VIEW_CACHE=0` is off.
+struct ViewCache {
+    heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+    next: u32,
+    map: std::collections::HashMap<(usize, Option<[u32; 10]>), Option<u32>>,
+    kept: Vec<ID3D12Resource>,
+}
+
+const VIEW_CACHE: u32 = 1 << 16;
+static VIEW_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VIEWS: Mutex<Option<ViewCache>> = Mutex::new(None);
+
+fn view_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// A cached view for `key` copied to `at`: `Some(true)`, or `Some(false)`
+/// if its texture cannot take it; `None` if it is not cached.
+fn view_cache_copy(key: (usize, Option<[u32; 10]>), at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<bool> {
+    if !view_cache_on() {
+        return None;
+    }
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = views.as_ref()?;
+    let slot = *cache.map.get(&key)?;
+    let Some(i) = slot else { return Some(false) };
+    VIEW_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let host = host()?;
+    let from = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cache.start + i as usize * cache.step };
+    // SAFETY: a slot of the view cache (a CPU heap) to a slot of ours.
+    unsafe { host.device.CopyDescriptorsSimple(1, at, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    Some(true)
+}
+
+/// Caches the view `made` writes (or that `texture` cannot take one, for
+/// `None`) and copies it to `at`; false if nothing was cached (the caller
+/// makes it at `at` itself).
+fn view_cache_put(
+    key: (usize, Option<[u32; 10]>),
+    made: Option<&dyn Fn(D3D12_CPU_DESCRIPTOR_HANDLE)>,
+    texture: &ID3D12Resource,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> bool {
+    if !view_cache_on() {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if views.is_none() {
+        // SAFETY: plain heap creation (a CPU heap: copies from it are cheap).
+        let heap: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: VIEW_CACHE,
+                ..Default::default()
+            })
+        };
+        let Ok(heap) = heap else { return false };
+        // SAFETY: a live heap.
+        let (start, step) = unsafe {
+            (
+                heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+            )
+        };
+        *views = Some(ViewCache { heap, start, step, next: 0, map: Default::default(), kept: Vec::new() });
+    }
+    let cache = views.as_mut().unwrap();
+    let _ = &cache.heap;
+    if cache.next == VIEW_CACHE {
+        cache.next = 0;
+        cache.map.clear();
+        cache.kept.clear();
+    }
+    cache.kept.push(texture.clone());
+    let misses = cache.kept.len();
+    if misses.is_power_of_two() && misses >= 64 {
+        tracing::info!(misses, hits = VIEW_HITS.load(std::sync::atomic::Ordering::Relaxed), "view cache");
+    }
+    let Some(made) = made else {
+        cache.map.insert(key, None);
+        return true;
+    };
+    let i = cache.next;
+    cache.next += 1;
+    let from = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cache.start + i as usize * cache.step };
+    made(from);
+    cache.map.insert(key, Some(i));
+    // SAFETY: a slot of the view cache to a slot of ours.
+    unsafe { host.device.CopyDescriptorsSimple(1, at, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1860,6 +2087,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
+                let key = (windows::core::Interface::as_raw(texture) as usize, *desc);
+                if let Some(hit) = view_cache_copy(key, at) {
+                    return hit.then(|| Some(texture.clone()));
+                }
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
                 // pad, then first level, levels, plane): each distinct one
@@ -1886,16 +2117,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                    view_cache_put(key, None, texture, at);
                     return None;
                 }
-                // SAFETY: a live texture and a slot of our heap.
-                unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
+                let made = |at| {
+                    // SAFETY: a live texture and a slot of our heap (or of
+                    // the view cache).
+                    unsafe {
+                        device.CreateShaderResourceView(
+                            texture,
+                            desc.as_ref().map(std::ptr::from_ref),
+                            at,
+                        )
+                    }
                 };
+                if !view_cache_put(key, Some(&made), texture, at) {
+                    made(at);
+                }
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)

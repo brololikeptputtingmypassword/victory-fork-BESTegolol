@@ -183,12 +183,15 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (0, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Shared tables the list holds: title heap, key, first slot; let go
+    /// with the dynamic slots.
+    shared: Vec<(usize, crate::descriptor::host::TableKey, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -205,6 +208,9 @@ impl Drop for State {
         for &(heap, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        for &(heap, key, first) in &self.shared {
+            crate::descriptor::drop_shared(heap, key, first);
+        }
     }
 }
 
@@ -217,7 +223,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        if self.tables_gone && self.dynamic.is_empty() {
+        if self.tables_gone && self.dynamic.is_empty() && self.shared.is_empty() {
             return;
         }
         if self.tables_gone {
@@ -226,6 +232,9 @@ impl State {
         }
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
+        }
+        for (heap, key, first) in self.shared.drain(..) {
+            crate::descriptor::drop_shared(heap, key, first);
         }
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
@@ -899,7 +908,11 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            let _spt = crate::copystat::Span::new();
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            #[cfg(feature = "diagnostics")]
+            drop(_spt);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1683,6 +1696,8 @@ impl State {
             }
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let _sp1 = crate::copystat::Span::new();
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -1696,6 +1711,10 @@ impl State {
             }
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        drop(_sp1);
+        #[cfg(feature = "diagnostics")]
+        let _sp2 = crate::copystat::Span::new();
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
@@ -1709,6 +1728,10 @@ impl State {
             }
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        drop(_sp2);
+        #[cfg(feature = "diagnostics")]
+        let _sp3 = crate::copystat::Span::new();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1901,10 +1924,14 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        {
+        #[cfg(feature = "diagnostics")]
+        let _spe = crate::copystat::Span::new();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
+        }
         }
         let mut made = Vec::new();
         for slot in fresh {
@@ -1956,6 +1983,8 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            #[cfg(feature = "diagnostics")]
+            let _spk = crate::copystat::Span::new();
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1964,8 +1993,15 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, n, h.finish())
+                // Not the table's address: the words name the view record
+                // and its generation, and the title writes the same table
+                // at a new address for each draw.
+                (0, n, h.finish())
             };
+            #[cfg(feature = "diagnostics")]
+            drop(_spk);
+            #[cfg(feature = "diagnostics")]
+            let _sph = crate::copystat::Span::new();
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -1987,6 +2023,42 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            drop(_sph);
+            let heap_at = std::ptr::from_ref(heap) as usize;
+            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            if crate::descriptor::host::shared_tables_on()
+                && let Some(first) = host.shared_take(key)
+            {
+                // Made by another list: what this draw reads is brought up
+                // to date here as if it made the table itself.
+                self.fresh_tables.insert(key, first);
+                self.shared.push((heap_at, key, first));
+                for k in 0..n {
+                    let Some(view) = crate::descriptor::view(table + u64::from(k) * 32) else {
+                        continue;
+                    };
+                    let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                    let kind = used.map(|u| u.kind).or_else(|| {
+                        selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                    });
+                    if let Some(kind) = kind {
+                        readable(list, kind, &view);
+                    }
+                    if let Some(title) = title_first
+                        && crate::descriptor::host::is_texture_view(&view)
+                    {
+                        host.texture_slot_tabled(title + k, kind.is_some());
+                        if kind.is_some() {
+                            host.mirror(title + k, table + u64::from(k) * 32, true);
+                        }
+                    }
+                }
+                made.push((slot, first * 32));
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            let _spm = crate::copystat::Span::new();
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
@@ -1994,11 +2066,8 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The title's own slots of this table: what the draw reads of
-            // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // Tables with constants hold this list's scratch copies: not shared.
+            let mut constants = false;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -2012,20 +2081,31 @@ impl State {
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
+                        constants = true;
                     }
                     Some(view) => {
+                        #[cfg(feature = "diagnostics")]
+                        let _spa = crate::copystat::Span::new();
                         host.make_at(index, &view);
+                        #[cfg(feature = "diagnostics")]
+                        drop(_spa);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
+                        #[cfg(feature = "diagnostics")]
+                        let _spr = crate::copystat::Span::new();
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
                         }
+                        #[cfg(feature = "diagnostics")]
+                        drop(_spr);
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
                         // (its texture is up to date now), and made in
                         // place as the texture pass would have made it,
                         // for a shader that picks it by index all the same.
+                        #[cfg(feature = "diagnostics")]
+                        let _spi = crate::copystat::Span::new();
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
                         {
@@ -2042,6 +2122,12 @@ impl State {
                         }
                     }
                 }
+            }
+            if !constants && crate::descriptor::host::shared_tables_on() {
+                host.shared_add(key, first, n);
+                self.shared.push((heap_at, key, first));
+            } else {
+                self.dynamic.push((heap_at, first, n));
             }
             made.push((slot, first * 32));
         }
@@ -2286,11 +2372,17 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        #[cfg(feature = "diagnostics")]
+        let _sp1 = crate::copystat::Span::new();
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        #[cfg(feature = "diagnostics")]
+        drop(_sp1);
+        #[cfg(feature = "diagnostics")]
+        let _sp2 = crate::copystat::Span::new();
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
@@ -2428,12 +2520,20 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        drop(_sp2);
+        #[cfg(feature = "diagnostics")]
+        let _sp3 = crate::copystat::Span::new();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        drop(_sp3);
+        #[cfg(feature = "diagnostics")]
+        let _sp4 = crate::copystat::Span::new();
         if !ran {
             crate::indirect::done(list, &bounded);
             why("prepare failed");

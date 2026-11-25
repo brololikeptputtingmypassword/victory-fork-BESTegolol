@@ -5641,6 +5641,69 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        /// Logs, every 5 s, the longest time between two presents and how
+        /// many frames took over 50 ms: averages hide hitches (the start
+        /// screen: 30 fps on average while it visibly stutters).
+        fn frame_pacing() {
+            use std::time::{Duration, Instant};
+            struct Pacing {
+                last: Instant,
+                since: Instant,
+                worst: Duration,
+                slow: u32,
+                frames: u32,
+            }
+            static PACING: Mutex<Option<Pacing>> = Mutex::new(None);
+            let now = Instant::now();
+            let mut p = PACING.lock().unwrap_or_else(|e| e.into_inner());
+            let p = p.get_or_insert(Pacing { last: now, since: now, worst: Duration::ZERO, slow: 0, frames: 0 });
+            let gap = now - p.last;
+            p.last = now;
+            p.frames += 1;
+            p.worst = p.worst.max(gap);
+            p.slow += u32::from(gap > Duration::from_millis(50));
+            // Where a hitch's time went: the time counters that grew most
+            // during a frame over 200 ms.
+            #[cfg(feature = "diagnostics")]
+            {
+                static LAST: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+                let now_t = crate::copystat::times();
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                if gap > Duration::from_millis(200) && last.len() == now_t.len() {
+                    let mut grew: Vec<(&str, u64)> = now_t
+                        .iter()
+                        .zip(last.iter())
+                        .map(|(n, l)| (n.0, if n.1 >= l.1 { n.1 - l.1 } else { n.1 }))
+                        .filter(|g| g.1 >= 1000)
+                        .collect();
+                    grew.sort_by_key(|a| std::cmp::Reverse(a.1));
+                    let text: Vec<String> =
+                        grew.iter().take(6).map(|(n, v)| format!("{n} {} ms", v / 1000)).collect();
+                    let callers: Vec<String> = crate::copystat::take_callers()
+                        .iter()
+                        .map(|(l, ms)| format!("{l} {ms} ms"))
+                        .collect();
+                    tracing::info!(
+                        "frame pacing: a {:.0} ms frame spent: {} (recording by call: {})",
+                        gap.as_secs_f64() * 1000.0,
+                        if text.is_empty() { "nothing counted".into() } else { text.join(", ") },
+                        callers.join(", ")
+                    );
+                } else {
+                    let _ = crate::copystat::take_callers();
+                }
+                *last = now_t;
+            }
+            if now - p.since >= Duration::from_secs(5) {
+                tracing::info!(
+                    "frame pacing: longest frame {:.0} ms, {} of {} frames over 50 ms",
+                    p.worst.as_secs_f64() * 1000.0,
+                    p.slow,
+                    p.frames
+                );
+                (p.since, p.worst, p.slow, p.frames) = (now, Duration::ZERO, 0, 0);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -5650,6 +5713,7 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        frame_pacing();
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;

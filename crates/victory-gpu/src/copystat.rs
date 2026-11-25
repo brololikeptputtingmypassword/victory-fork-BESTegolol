@@ -135,6 +135,39 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
+/// The time counters in microseconds, read now (for a hitch's breakdown in
+/// the frame pacing line; the stats line resets them, so callers take
+/// deltas saturating).
+pub(crate) fn times() -> Vec<(&'static str, u64)> {
+    use C::*;
+    let us = |c: C, name| (name, COUNT[c as usize].load(Relaxed));
+    let ns = |c: C, name| (name, COUNT[c as usize].load(Relaxed) / 1000);
+    vec![
+        us(RunUs, "copy runs"),
+        us(QueryUs, "queries"),
+        us(MoveUs, "moves"),
+        us(WatchUs, "write watch"),
+        ns(RecordNs, "recording"),
+        us(PipelineWaitUs, "pipeline wait"),
+        ns(DynamicNs, "descriptor search"),
+        us(SnapshotUs, "snapshots"),
+        us(SparseUs, "sparse reads"),
+        us(PaceUs, "title frame waits"),
+        us(UntilRecordUs, "present to first list call"),
+        us(UntilSubmitUs, "present to first submit"),
+        us(TailUs, "last submit to present"),
+        ns(ResetNs, "list resets"),
+        us(BackScanUs, "copy-back scan"),
+        us(BackSyncUs, "copy-back sync"),
+        ns(WaitCheckNs, "wait checks"),
+        ns(HostListNs, "host lists made"),
+        us(WholeUs, "whole copies"),
+        us(CardOver32Us, "card waits over 32 ms"),
+        us(Card8To32Us, "card waits 8-32 ms"),
+        us(NothingBackUs, "card waits, nothing back"),
+    ]
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -946,6 +979,42 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
         }
     };
     &mut all[at].1
+}
+
+/// Recording time by source line (for a hitch's breakdown).
+static BY_CALLER: std::sync::Mutex<Vec<(&'static str, u32, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Time from `started` to now, counted for the source line `at`.
+pub(crate) fn recorded_at(started: std::time::Instant, at: &'static std::panic::Location<'static>) {
+    let ns = started.elapsed().as_nanos() as u64;
+    let file = at.file().rsplit(['/', '\\']).next().unwrap_or("");
+    let mut all = BY_CALLER.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|e| e.1 == at.line() && e.0 == file) {
+        Some(e) => e.2 += ns,
+        None => all.push((file, at.line(), ns)),
+    }
+}
+
+/// Times the rest of the scope it is made in, by its line.
+pub(crate) struct Span(std::time::Instant, &'static std::panic::Location<'static>);
+impl Span {
+    #[track_caller]
+    pub(crate) fn new() -> Self {
+        Self(std::time::Instant::now(), std::panic::Location::caller())
+    }
+}
+impl Drop for Span {
+    fn drop(&mut self) {
+        recorded_at(self.0, self.1);
+    }
+}
+
+/// The lines whose calls took longest since the last asking, in
+/// milliseconds; resets.
+pub(crate) fn take_callers() -> Vec<(String, u64)> {
+    let mut all = std::mem::take(&mut *BY_CALLER.lock().unwrap_or_else(|e| e.into_inner()));
+    all.sort_by_key(|a| std::cmp::Reverse(a.2));
+    all.into_iter().take(10).map(|(f, l, ns)| (format!("{f}:{l}"), ns / 1_000_000)).collect()
 }
 
 /// A list call on this thread that began at `started` has returned.
