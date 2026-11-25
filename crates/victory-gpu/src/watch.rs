@@ -383,6 +383,99 @@ struct Guards {
     /// views' blocks are in it too): a write to one opens them all.
     /// (Ported from VIctory-Belobug-AMD, GPL-3.0.)
     aliased: BTreeSet<usize>,
+    /// What the kernel is writing for the runtime or the title
+    /// ([`KernelWrite`]): not made read-only meanwhile, and reported written
+    /// at every check. (The idea is VIctory-Belobug-AMD's, which pins for
+    /// two seconds; here until the write is over.)
+    pins: Vec<Pin>,
+    /// Blocks at which the pinned blocks' pages are shown too, and by how
+    /// many pins.
+    pinned_others: BTreeMap<usize, u32>,
+    /// Pins made so far.
+    pins_made: u64,
+}
+
+/// Blocks `[from, to)` the kernel is writing, and the other blocks their
+/// pages are shown at.
+struct Pin {
+    number: u64,
+    from: usize,
+    to: usize,
+    others: Vec<usize>,
+    /// For a write that may go on after the call that asked for it.
+    until: Option<std::time::Instant>,
+}
+
+/// How long the blocks of a write that may go on after its call are pinned.
+const PIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether blocks the kernel writes are left writable until it has
+/// (`VICTORY_PINS=0`: opened before, as it was).
+fn pins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PINS").is_none_or(|v| v != "0"))
+}
+
+impl Guards {
+    /// Whether `block` is being written by the kernel.
+    fn pinned(&self, block: usize) -> bool {
+        !self.pins.is_empty()
+            && (self.pins.iter().any(|p| p.from <= block && block < p.to) || self.pinned_others.contains_key(&block))
+    }
+
+    /// Opens `[start, end)` and the other views of its pages, and pins them.
+    fn pin(&mut self, start: usize, end: usize, until: Option<std::time::Instant>) -> u64 {
+        let (from, to) = (start / BLOCK, end.div_ceil(BLOCK));
+        open(self, start, end);
+        let others = others(start, end);
+        for &block in &others {
+            open_here(self, block * BLOCK, (block + 1) * BLOCK);
+            *self.pinned_others.entry(block).or_default() += 1;
+        }
+        self.pins_made += 1;
+        let number = self.pins_made;
+        self.pins.push(Pin { number, from, to, others, until });
+        number
+    }
+
+    /// Lets go of the pins `gone` picks.
+    fn unpin(&mut self, gone: impl Fn(&Pin) -> bool) {
+        for pin in self.pins.extract_if(.., |p| gone(p)) {
+            for block in pin.others {
+                if let Some(n) = self.pinned_others.get_mut(&block) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.pinned_others.remove(&block);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The blocks other than its own at which the pages of `[start, end)` are
+/// shown (pages shown at too many places left out).
+fn others(start: usize, end: usize) -> Vec<usize> {
+    if !view_guard() {
+        return Vec::new();
+    }
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(views) = views.as_ref() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    // By the views there are: the length is the title's, and may be anything.
+    let first = views.by_addr.range(..=start).next_back().map_or(start, |(a, _)| *a);
+    for (&base, &(len, ..)) in views.by_addr.range(first..end) {
+        let (a, b) = (base.max(start - start % BLOCK), (base + len).min(end));
+        for at in (a..b).step_by(BLOCK) {
+            let shown = views.shown(at);
+            if (2..=MANY_VIEWS).contains(&shown.len()) {
+                found.extend(shown.iter().filter(|&&x| x != at).map(|x| x / BLOCK));
+            }
+        }
+    }
+    found
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -390,6 +483,9 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    pins: Vec::new(),
+    pinned_others: BTreeMap::new(),
+    pins_made: 0,
 });
 
 /// Views of one page past which its views are not guarded together (the
@@ -521,6 +617,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     let mut g = guards();
+    if !g.pins.is_empty() {
+        let now = std::time::Instant::now();
+        g.unpin(|p| p.until.is_some_and(|until| until <= now));
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -555,7 +655,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
+            if g.pinned(block) {
+                // The kernel is writing it: left writable, and written at
+                // every check until it has.
+            } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
             } else {
@@ -662,7 +765,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         for &at in shown {
             let alias = at / BLOCK;
             g.aliased.insert(alias);
-            if alias != block && !g.protected.contains(&alias) {
+            if alias != block && !g.protected.contains(&alias) && !g.pinned(alias) {
                 let mut old = 0;
                 // SAFETY: title view memory; only its protection changes.
                 if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
@@ -732,10 +835,48 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
+///
+/// Another thread can guard them again before the kernel writes, which then
+/// fails: [`kernel_writing`] where the call that writes is at hand.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len);
+}
+
+/// A write into title memory by the kernel, as long as it goes on.
+#[must_use = "the blocks are guarded again once it is dropped"]
+pub struct KernelWrite(u64);
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            guards().unpin(|p| p.number == self.0);
+        }
+    }
+}
+
+/// As [`writing`], and nobody guards the blocks (or, at the other views of
+/// their pages, makes them read-only here) until the result is dropped: the
+/// kernel's write would fail on them, and the read be lost.
+pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    if !pins() || len == 0 {
+        writing(at, len);
+        return KernelWrite(0);
+    }
+    let number = guards().pin(at, at.saturating_add(len), None);
+    crate::descriptor::host::remapped(at, len);
+    KernelWrite(number)
+}
+
+/// As [`kernel_writing`], for a write that may go on after its call returned:
+/// for two seconds.
+pub fn kernel_writing_later(at: usize, len: usize) {
+    if !pins() || len == 0 {
+        return writing(at, len);
+    }
+    guards().pin(at, at.saturating_add(len), Some(std::time::Instant::now() + PIN));
     crate::descriptor::host::remapped(at, len);
 }
 
@@ -953,14 +1094,31 @@ mod tests {
             file.rewind().unwrap();
             // SAFETY: 13 bytes of our view, nothing else refers to them.
             let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
-            file.read(into).is_ok_and(|n| n == 13)
+            file.read(into).map_err(|e| e.raw_os_error())
         };
-        assert!(
-            !read(&mut file),
-            "the kernel does not fault into our handler"
-        );
+        // The kernel does not fault into our handler: the read fails, as
+        // `ERROR_INVALID_USER_BUFFER` or `ERROR_NOACCESS` (the codes
+        // `dstorage`'s `read_into` opens the pages again for).
+        let refused = |r: Result<usize, Option<i32>>| matches!(r, Err(Some(1784 | 998)));
+        assert!(refused(read(&mut file)));
         writing(view + 100, 13);
-        assert!(read(&mut file));
+        // Guarded again before the read: it fails as if never opened, and
+        // opening again lets it through.
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(refused(read(&mut file)));
+        // Pinned, it is not guarded, and is reported written, until the write
+        // is over.
+        let first = (view / PAGE..view / PAGE + 1).collect::<Vec<_>>();
+        let pin = kernel_writing(view + 100, 13);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(first.clone()));
+        assert_eq!(read(&mut file), Ok(13));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(first.clone()));
+        drop(pin);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(first));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        assert!(refused(read(&mut file)));
+        writing(view + 100, 13);
+        assert_eq!(read(&mut file), Ok(13));
         // SAFETY: the bytes just read.
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
