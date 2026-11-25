@@ -177,6 +177,16 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// Removes a leftover version. One that cannot be removed is only logged: the newest
+/// committed version is still the container. (Run from the Claude desktop app, the host's
+/// `AppData\Local` is the package's redirected copy, where removing a folder the real one
+/// also holds fails with os error 4395; failing the read then cost a run its saves.)
+fn forget(path: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        tracing::debug!(path = %path.display(), %e, "game save: an old version stays");
+    }
+}
+
 /// The container's newest committed version, if any. Removes what a crash
 /// left: unfinished versions and older ones.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -185,7 +195,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            forget(&entry.path());
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
@@ -195,7 +205,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         return Ok(None);
     };
     for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        forget(&dir.join(format!("v{old}")));
     }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
