@@ -1229,6 +1229,10 @@ impl HostHeap {
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
             // this slot.
+            // The same resource again (most tables): nothing to retire.
+            if slot.as_ref().map(windows::core::Interface::as_raw) == resource.as_ref().map(windows::core::Interface::as_raw) {
+                return;
+            }
             if let Some(old) = std::mem::replace(slot, resource) {
                 crate::host::retire(old);
             }
@@ -1976,7 +1980,7 @@ struct ViewCache {
 
 const VIEW_CACHE: u32 = 1 << 16;
 static VIEW_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static VIEWS: Mutex<Option<ViewCache>> = Mutex::new(None);
+static VIEWS: std::sync::RwLock<Option<ViewCache>> = std::sync::RwLock::new(None);
 
 fn view_cache_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1989,7 +1993,7 @@ fn view_cache_copy(key: (usize, Option<[u32; 10]>), at: D3D12_CPU_DESCRIPTOR_HAN
     if !view_cache_on() {
         return None;
     }
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let cache = views.as_ref()?;
     let slot = *cache.map.get(&key)?;
     let Some(i) = slot else { return Some(false) };
@@ -2014,7 +2018,7 @@ fn view_cache_put(
         return false;
     }
     let Some(host) = host() else { return false };
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     if views.is_none() {
         // SAFETY: plain heap creation (a CPU heap: copies from it are cheap).
         let heap: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
