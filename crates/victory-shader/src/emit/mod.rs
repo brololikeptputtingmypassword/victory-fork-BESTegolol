@@ -652,6 +652,22 @@ fn emit_program(
             _ => 0,
         };
     }
+    // DXIL packs one interpolation mode per row. A float the console packs
+    // beside an integer in a stage's outputs is declared constant too: the
+    // pixel shader's inputs say how it is interpolated (the title's
+    // 61d47169dce53a3b reads such a COLOR flat), an output's mode nothing.
+    if !pixel {
+        let flat: Vec<u32> = outputs
+            .iter()
+            .filter(|e| e.interp == 1)
+            .filter_map(|e| e.row)
+            .collect();
+        for e in &mut outputs {
+            if e.interp == 2 && e.row.is_some_and(|r| flat.contains(&r)) {
+                e.interp = 1;
+            }
+        }
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {

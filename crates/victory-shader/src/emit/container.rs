@@ -72,7 +72,10 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), elements that share
+    // a register in element order (not by column: it sorts by register
+    // alone, so an element packed after a later one in the same row, as
+    // the console's packing often is, keeps its place).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +93,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -415,5 +418,28 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// The validator rebuilds `ISG1`/`OSG1` from the module sorted by
+    /// register alone: two elements packed into one row keep their element
+    /// order (the console packs a w-only element ahead of an xyz one), or
+    /// the part "does not match expected for module".
+    #[test]
+    fn elements_sharing_a_row_keep_their_order() {
+        let el = |name: &str, col, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(2),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let part = signature(&[el("COLOR", 3, 1), el("TEXCOORD", 0, 3)], true);
+        // the mask byte of each 32-byte row
+        assert_eq!([part[8 + 24], part[8 + 32 + 24]], [0b1000, 0b0111]);
     }
 }
