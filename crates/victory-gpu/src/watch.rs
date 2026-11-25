@@ -379,13 +379,121 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks whose page was guarded together with its other views (those
+    /// views' blocks are in it too): a write to one opens them all.
+    /// (Ported from VIctory-Belobug-AMD, GPL-3.0.)
+    aliased: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    aliased: BTreeSet::new(),
 });
+
+/// Views of one page past which its views are not guarded together (the
+/// page the title shows wherever it has nothing has thousands).
+const MANY_VIEWS: usize = 64;
+
+/// The views of physical pages the runtime mapped: by address (length,
+/// section, offset in it), and the addresses each page of a section is
+/// shown at. A title write through one view of a page must make every
+/// other view's copy stale too (black or stale textures otherwise).
+#[derive(Default)]
+struct Views {
+    by_addr: BTreeMap<usize, (usize, usize, u64)>,
+    pages: std::collections::HashMap<(usize, u64), Vec<usize>>,
+}
+
+static VIEWS: Mutex<Option<Views>> = Mutex::new(None);
+
+/// Whether all the views of a guarded page are guarded together
+/// (`VICTORY_VIEW_GUARD=0` turns it off).
+fn view_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
+}
+
+impl Views {
+    /// Forgets the views overlapping `[at, at + len)`, whole.
+    fn forget(&mut self, at: usize, len: usize) {
+        let end = at.saturating_add(len);
+        let first = self
+            .by_addr
+            .range(..=at)
+            .next_back()
+            .filter(|(a, (n, _, _))| *a + n > at)
+            .map(|(a, _)| *a);
+        let hit: Vec<usize> = first
+            .into_iter()
+            .chain(self.by_addr.range(at.saturating_add(1)..end).map(|(a, _)| *a))
+            .collect();
+        for a in hit {
+            let Some((n, section, offset)) = self.by_addr.remove(&a) else {
+                continue;
+            };
+            for k in 0..n / BLOCK {
+                let key = (section, offset / BLOCK as u64 + k as u64);
+                if let Some(shown) = self.pages.get_mut(&key) {
+                    shown.retain(|&x| x != a + k * BLOCK);
+                    if shown.is_empty() {
+                        self.pages.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every address the page shown at `at` (a block's start) is shown at,
+    /// `at` included; empty if `at` is in no view we were told of.
+    fn shown(&self, at: usize) -> &[usize] {
+        let Some((&base, &(n, section, offset))) = self.by_addr.range(..=at).next_back() else {
+            return &[];
+        };
+        if at >= base + n {
+            return &[];
+        }
+        let key = (section, offset / BLOCK as u64 + ((at - base) / BLOCK) as u64);
+        self.pages.get(&key).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Every address the page of the block at `at` is shown at.
+fn aliases(at: usize) -> Vec<usize> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    views.as_ref().map_or(Vec::new(), |v| v.shown(at - at % BLOCK).to_vec())
+}
+
+/// The runtime mapped a view at `[at, at + len)` of the bytes from `offset`
+/// on of the physical-page section `section` (called from
+/// `inplace::title_memory_view`). The view is writable, so the same pages
+/// guarded at another view are opened: their copies check them again.
+pub(crate) fn view_mapped(at: usize, len: usize, section: usize, offset: u64) {
+    if !view_guard() || len == 0 || !at.is_multiple_of(BLOCK) || !offset.is_multiple_of(BLOCK as u64) {
+        return;
+    }
+    let mut others = Vec::new();
+    {
+        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let views = views.get_or_insert_with(Views::default);
+        views.forget(at, len);
+        views.by_addr.insert(at, (len, section, offset));
+        for k in 0..len / BLOCK {
+            let shown = views.pages.entry((section, offset / BLOCK as u64 + k as u64)).or_default();
+            if shown.len() < MANY_VIEWS {
+                others.extend_from_slice(shown);
+            }
+            shown.push(at + k * BLOCK);
+        }
+    }
+    if !others.is_empty() {
+        let mut g = guards();
+        for a in others {
+            open_here(&mut g, a, a + BLOCK);
+        }
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -529,13 +637,38 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     };
     if set(from, to) {
         note(g, from, to);
+    } else {
+        for block in from..to {
+            if set(block, block + 1) {
+                note(g, block, block + 1);
+            } else if block < uncommitted_end(block) {
+                g.absent.insert(block);
+            }
+        }
+    }
+    if !view_guard() {
         return;
     }
+    // The same pages at their other views: read-only too, so a write
+    // through one of those faults. Not noted clean: the copies at those
+    // views have not taken the pages yet.
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(views) = views.as_ref() else { return };
     for block in from..to {
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+        let shown = views.shown(block * BLOCK);
+        if shown.len() < 2 || shown.len() > MANY_VIEWS || !g.protected.contains(&block) {
+            continue;
+        }
+        for &at in shown {
+            let alias = at / BLOCK;
+            g.aliased.insert(alias);
+            if alias != block && !g.protected.contains(&alias) {
+                let mut old = 0;
+                // SAFETY: title view memory; only its protection changes.
+                if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+                    g.protected.insert(alias);
+                }
+            }
         }
     }
 }
@@ -557,8 +690,28 @@ fn uncommitted_end(block: usize) -> usize {
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
+/// notes them written; true if any was guarded. The same pages at their
+/// other views are opened too: every guard over them must copy them again.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    let any = open_here(g, start, end);
+    if start >= end || g.aliased.is_empty() {
+        return any;
+    }
+    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    for block in aliased {
+        g.aliased.remove(&block);
+        for at in aliases(block * BLOCK) {
+            if at / BLOCK != block {
+                open_here(g, at, at + BLOCK);
+            }
+            g.aliased.remove(&(at / BLOCK));
+        }
+    }
+    any
+}
+
+/// [`open`] for one range, without the other views of its pages.
+fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -652,10 +805,18 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
+    let aliased: Vec<usize> = g.aliased.range(range.clone()).copied().collect();
+    for block in aliased {
+        g.aliased.remove(&block);
+    }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    drop(g);
+    if let Some(views) = VIEWS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        views.forget(at, len);
     }
 }
 
