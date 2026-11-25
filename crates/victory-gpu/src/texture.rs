@@ -306,6 +306,25 @@ fn no_wait() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
+/// Whether a staging buffer's first read is made whole and waited for
+/// (`VICTORY_TEXTURE_FIRST=1`; off by default).
+///
+/// A list copies the staging buffer whether or not its refresh read
+/// anything, and a texture picked by index is staged once, uploaded and let
+/// go: "read at its next refresh" ([`no_wait`]) never comes, the slot counts
+/// as uploaded with the memory's fingerprint, and the host copy keeps what
+/// the buffer held (zeros, or another texture's bytes) while the memory says
+/// nothing has changed. With the switch the first read of a buffer waits for
+/// title memory to hold still, and one that finds only zeros writes them.
+fn first_whole() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// First reads of a staging buffer that waited, of those [`first_whole`]
+/// would have found skipped ([`Staging::refresh_unlocked`]).
+pub(crate) static FIRST_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
@@ -730,10 +749,22 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
+            match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None => {
+                    let first = last.hash.is_none() && first_whole();
+                    let read = self.refresh_unlocked(last, size);
+                    if read > 0 || !first {
+                        return read;
+                    }
+                    // Nothing in the buffer yet, and a list copies it.
+                    let n = FIRST_WAITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n.is_power_of_two() {
+                        tracing::info!(times = n, "a texture's first read waited for title memory to hold still");
+                    }
+                    waited(2, crate::watch::title_memory_reading)
+                }
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -758,8 +789,9 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
+                let first = last.hash.is_none() && first_whole();
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if !first && read.iter().all(|&b| b == 0) {
                     return false;
                 }
                 self.detile(read);

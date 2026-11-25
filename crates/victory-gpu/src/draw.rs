@@ -394,6 +394,13 @@ const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 /// 1.6 s to 160 s between looks, so colour the title filled late came late.
 const RECHECK_MS: [u64; 5] = [130, 400, 1300, 4000, 13000];
 
+/// The waits between looks at uploaded textures by the time a frame takes
+/// (`VICTORY_RECHECK_PER_FRAME=1`; off by default), not a pass.
+fn recheck_per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_PER_FRAME").is_some_and(|v| v == "1"))
+}
+
 fn recheck_ms() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_MS").is_some_and(|v| v != "0"));
@@ -1736,6 +1743,21 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+        // The pass runs several times a frame, so that is not a frame's time: a wait of
+        // 13 s became 2,000 frames, minutes. With `VICTORY_RECHECK_PER_FRAME=1` (off by
+        // default) it is, over the last eight frames or more.
+        let took = if recheck_per_frame() {
+            static OVER: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
+            let mut over = OVER.lock().unwrap_or_else(|e| e.into_inner());
+            if over.1 == 0 || frame < over.0 {
+                *over = (frame, now.max(1), 100);
+            } else if frame >= over.0 + 8 {
+                *over = (frame, now, (now.saturating_sub(over.1) / (frame - over.0)).max(1));
+            }
+            over.2
+        } else {
+            took
+        };
         // With `VICTORY_RECHECK_MS=1` down to 2 frames: 16 frames was 6 s at 2.5 fps.
         let most = (4000 / took).clamp(if recheck_ms() { 2 } else { 16 }, 256);
         // What a table entry of a texture a shader samples says.
