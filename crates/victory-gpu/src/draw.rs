@@ -389,6 +389,26 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// The same schedule by the clock (`VICTORY_RECHECK_MS=1`): about what
+/// `RECHECK_FRAMES` meant at 30 fps. At 2.5 fps the frame schedule was
+/// 1.6 s to 160 s between looks, so colour the title filled late came late.
+const RECHECK_MS: [u64; 5] = [130, 400, 1300, 4000, 13000];
+
+fn recheck_ms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_MS").is_some_and(|v| v != "0"))
+}
+
+/// Frames to the `i`-th recheck look, by frames or by the clock with
+/// `took` ms a frame.
+fn recheck_wait(i: usize, took: u64) -> u64 {
+    if recheck_ms() {
+        RECHECK_MS[i].div_ceil(took.max(1)).max(1)
+    } else {
+        RECHECK_FRAMES[i]
+    }
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, that found it changed (uploaded again), and that found the host copy
 /// made anew, its memory unchanged (uploaded again), since the start.
@@ -1681,7 +1701,8 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // With `VICTORY_RECHECK_MS=1` down to 2 frames: 16 frames was 6 s at 2.5 fps.
+        let most = (4000 / took).clamp(if recheck_ms() { 2 } else { 16 }, 256);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1770,13 +1791,13 @@ impl State {
                     let forever = *FOREVER
                         .get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_none_or(|v| v != "0"));
                     let last = RECHECK_FRAMES.len() - 1;
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    match RECHECK_FRAMES.get(usize::from(looks) + 1).map(|_| recheck_wait(usize::from(looks) + 1, took)) {
                         Some(wait) => {
                             let checked = crate::descriptor::host::Checked { looks: looks + 1, ..checked };
                             host.texture_slot_recheck(index, write, frame + wait, checked)
                         }
                         None if forever => {
-                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[last], checked)
+                            host.texture_slot_recheck(index, write, frame + recheck_wait(last, took), checked)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -1916,7 +1937,7 @@ impl State {
                     let print = crate::texture::fingerprint(at, len);
                     let copy = crate::resource::copy_serial(resource);
                     let checked = crate::descriptor::host::Checked { at, len, print, looks: 0, uploaded: frame, copy };
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], checked);
+                    host.texture_slot_recheck(index, write, frame + recheck_wait(0, took), checked);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
