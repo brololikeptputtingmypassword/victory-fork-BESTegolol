@@ -2104,6 +2104,52 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+/// Of a placed texture's memory only what a view of it shows counts
+/// ([`placed_view_bytes`]): `VICTORY_MIP_SPANS=1`.
+#[cfg(windows)]
+pub(crate) fn mip_spans() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIP_SPANS").is_some_and(|v| v != "0"))
+}
+
+/// The bytes, from the texture's start, that a view (`desc`, as words) of a
+/// texture placed with the resource description `resource` shows: those up
+/// to its most detailed mip. The smaller mips lie first, and the title
+/// streams by views that begin at a later mip: it has other textures where
+/// the larger mips would be. Taken for all of the texture's, as without
+/// [`mip_spans`], such a view made the textures there stale (null for the
+/// rest of the run: 114,515 slots in the opening cutscene), said more or
+/// less of itself was mapped than is, and changed when they did.
+/// All of it for anything but a 2D view of a texture of one slice.
+#[cfg(windows)]
+pub(crate) fn placed_view_bytes(resource: &[u32; 14], desc: &[u32; 16]) -> Option<u64> {
+    const VIEW_2D: u32 = 4;
+    let all = placed_bytes(resource)?;
+    if !mip_spans() || desc[1] != VIEW_2D || desc[4] == 0 {
+        return Some(all);
+    }
+    static KNOWN: std::sync::Mutex<Option<std::collections::HashMap<([u32; 14], u32), u64>>> = std::sync::Mutex::new(None);
+    let mut key = (*resource, desc[4]);
+    (key.0[1], key.0[13]) = (0, 0);
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    Some(*known.get_or_insert_default().entry(key).or_insert_with(|| bytes_from(resource, desc[4], all)))
+}
+
+/// [`placed_view_bytes`] of a 2D view from mip `mip` on; `all`: the
+/// texture's bytes.
+#[cfg(windows)]
+fn bytes_from(resource: &[u32; 14], mip: u32, all: u64) -> u64 {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { resource.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == TEXTURE_3D || d.depth_or_array_size > 1 || d.sample_count > 1 {
+        return all;
+    }
+    match texture_layout(&d).as_ref().map(|t| t.planes.as_slice()) {
+        Some([plane]) => plane.layout.bytes_from(mip).clamp(1, all),
+        _ => all,
+    }
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

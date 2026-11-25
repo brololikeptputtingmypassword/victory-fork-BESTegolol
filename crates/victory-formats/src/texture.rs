@@ -519,6 +519,21 @@ impl Layout {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
     }
 
+    /// The bytes from the start of a slice that mip `mip` and the smaller
+    /// ones take: in the tiled modes the chain lies from the smallest mip up
+    /// (the tail's block first), so a title that streams textures may put
+    /// something else where the larger ones would be.
+    pub fn bytes_from(&self, mip: u32) -> u64 {
+        match (mip as usize).checked_sub(1).and_then(|above| self.mips.get(above)) {
+            Some(above) if self.desc.swizzle != Swizzle::LINEAR && mip <= self.first_tail_mip => above.offset,
+            // In the tail: all of its block.
+            Some(_) if self.desc.swizzle != Swizzle::LINEAR && self.first_tail_mip > 0 => {
+                self.mips.get(self.first_tail_mip as usize - 1).map_or(self.slice_size, |m| m.offset)
+            }
+            _ => self.slice_size,
+        }
+    }
+
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {
@@ -876,6 +891,30 @@ mod tests {
             deep.depth = u32::MAX;
             assert_eq!(Layout::new(&deep), Err(Error::Invalid));
         }
+    }
+
+    /// A 1024x1024 texture of 4x4 blocks of 8 bytes: without its largest mip
+    /// the chain takes its first 0x2b000 bytes, as a title's streamer backs.
+    #[test]
+    fn the_smaller_mips_lie_first() {
+        let mut bc1 = desc(1024, 1024, 11, 8, Swizzle::SW_64KB_D_X);
+        bc1.block = 4;
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D_X] {
+            bc1.swizzle = swizzle;
+            let l = Layout::new(&bc1).unwrap();
+            assert_eq!(l.bytes_from(0), l.slice_size);
+            for mip in 1..=11 {
+                assert!(l.bytes_from(mip) <= l.bytes_from(mip - 1) && l.bytes_from(mip) > 0, "{mip}");
+            }
+            for mip in 1..l.first_tail_mip {
+                assert_eq!(l.bytes_from(mip), l.mips[mip as usize - 1].offset);
+                let shown = l.mips[mip as usize].offset;
+                assert!(shown < l.bytes_from(mip));
+            }
+        }
+        bc1.swizzle = Swizzle::LINEAR;
+        let l = Layout::new(&bc1).unwrap();
+        assert_eq!(l.bytes_from(3), l.slice_size);
     }
 
     #[test]

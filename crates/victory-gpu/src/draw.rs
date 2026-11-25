@@ -421,10 +421,11 @@ pub(crate) static HEAP_TEXTURES_PART_CHECKED: [AtomicU64; 3] = [const { AtomicU6
 
 /// For the control channel: slot `index`, which shows `resource`, was uploaded.
 #[cfg(feature = "diagnostics")]
-fn note_upload(index: u32, resource: This, frame: u64, whole: bool, tabled: bool) {
+fn note_upload(index: u32, resource: This, shown: Option<(u64, u64)>, frame: u64, whole: bool, tabled: bool) {
     if crate::control::folder().is_some()
-        && let Some((at, len)) = crate::texture::staged_memory(resource)
+        && let Some(all) = crate::texture::staged_memory(resource)
     {
+        let (at, len) = shown.unwrap_or(all);
         let print = crate::texture::fingerprint(at, len);
         let copy = crate::resource::copy_serial(resource);
         crate::control::uploaded(index, crate::control::Upload { at, len, print, copy, frame, whole, tabled });
@@ -1854,9 +1855,12 @@ impl State {
                 }
             }
             let mut partly = None;
+            // What the view shows of a placed texture: address and bytes.
+            let mut shown = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                let len = crate::resource::placed_view_bytes(&resource, &desc).unwrap_or(1);
+                shown = crate::resource::mip_spans().then_some((address, len));
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -1955,6 +1959,7 @@ impl State {
                 return;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
+            let whole = whole || shown.is_some_and(|(at, len)| crate::texture::committed(at as *const u8, len as usize));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
@@ -1973,7 +1978,7 @@ impl State {
                 // detile and upload all of it once more.
                 HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
-                note_upload(index, resource, frame, again.is_none(), true);
+                note_upload(index, resource, shown, frame, again.is_none(), true);
                 host.texture_slot_done(index, write, again);
                 continue;
             }
@@ -1983,7 +1988,7 @@ impl State {
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
             let memory = if again.is_none() && heap_recheck() {
-                crate::texture::staged_memory(resource)
+                crate::texture::staged_memory(resource).map(|all| shown.unwrap_or(all))
             } else {
                 None
             };
@@ -1993,11 +1998,11 @@ impl State {
             #[cfg(not(feature = "diagnostics"))]
             let noted = recheck_part();
             let part = match partly {
-                Some(_) if noted => crate::texture::staged_memory(resource),
+                Some(_) if noted => crate::texture::staged_memory(resource).map(|all| shown.unwrap_or(all)),
                 _ => None,
             };
             #[cfg(feature = "diagnostics")]
-            note_upload(index, resource, frame, again.is_none(), false);
+            note_upload(index, resource, shown, frame, again.is_none(), false);
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);

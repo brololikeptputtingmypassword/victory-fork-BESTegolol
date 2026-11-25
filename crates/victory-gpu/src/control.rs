@@ -282,7 +282,7 @@ fn slot(index: u32) -> String {
         let _ = write!(text, "{view:?}; queue {}", host.texture_slot_state(index));
         if let Some(View::Placed(false, resource, desc)) = &view {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            let len = crate::resource::placed_bytes(resource).unwrap_or(0);
+            let len = crate::resource::placed_view_bytes(resource, desc).unwrap_or(0);
             let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
             let _ = write!(text, "; memory {address:#x}+{len:#x}, mapped {mapped:#x}");
         }
@@ -311,6 +311,8 @@ fn audit(lines: usize) -> String {
     // [whole, partly, left to tables] x [as uploaded, changed, copy made anew]
     let mut counts = [[0u64; 3]; 3];
     let mut gone = 0u64;
+    // Out of the queue with no host copy: these read as nothing.
+    let mut dead = [0u64; 2];
     let mut changed: Vec<(u64, String)> = Vec::new();
     let now = crate::frame::current();
     let began = Instant::now();
@@ -326,6 +328,9 @@ fn audit(lines: usize) -> String {
         };
         let kind = if u.tabled { 2 } else { usize::from(!u.whole) };
         let same = crate::texture::fingerprint(u.at, u.len) == u.print;
+        if copy == 0 && queue == "none" {
+            dead[usize::from(same)] += 1;
+        }
         let what = match (same, copy == u.copy) {
             (false, _) => 1,
             (true, false) => 2,
@@ -349,7 +354,7 @@ fn audit(lines: usize) -> String {
     changed.sort_by_key(|c| std::cmp::Reverse(c.0));
     let mut text = format!(
         "frame {now}: {total} uploads, {gone} slots without a view; [as uploaded, changed, copy made anew]: \
-         whole {:?}, partly {:?}, left to tables {:?}; {} ms\n",
+         whole {:?}, partly {:?}, left to tables {:?}; out of the queue without a copy [other memory, as uploaded] {dead:?}; {} ms\n",
         counts[0],
         counts[1],
         counts[2],
