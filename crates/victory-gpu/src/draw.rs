@@ -390,8 +390,19 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
 /// Looks at uploaded textures picked by index that found the memory as it
-/// was, and that found it changed (uploaded again), since the start.
-pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// was, that found it changed (uploaded again), and that found the host copy
+/// made anew, its memory unchanged (uploaded again), since the start.
+pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether a look at an uploaded texture knows a host copy made anew by its
+/// number (`crate::resource::copy_serial`). `VICTORY_RECHECK_COPY=0`: by its
+/// staging buffer, as before; the pass lets that go itself right after the
+/// upload, so each look uploaded its texture again (1,710,001 of the 1,718,940
+/// uploads of a run, 185 MB a frame).
+fn recheck_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_COPY").is_none_or(|v| v != "0"))
+}
 
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
@@ -408,7 +419,7 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
-pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -1729,7 +1740,8 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            if let Some(checked) = host.texture_slot_checked(index) {
+                let crate::descriptor::host::Checked { at, len, print, looks, uploaded, copy } = checked;
                 // The same title memory says nothing of the host copy: the
                 // sweep (`resource::let_go_idle`) may have let it go and a
                 // use made it anew, empty, its staging state gone. Then it
@@ -1737,11 +1749,15 @@ impl State {
                 // that had loaded went black or see-through minutes later).
                 let still_staged = heap.handle(index).and_then(crate::descriptor::view).is_none_or(|v| {
                     match crate::descriptor::host::placed_texture(&v).unwrap_or(v) {
-                        View::Shader(resource, _) => crate::texture::is_staged(resource as This),
+                        View::Shader(resource, _) => {
+                            crate::texture::is_staged(resource as This)
+                                || (recheck_copy() && crate::resource::copy_serial(resource as This) == copy)
+                        }
                         _ => true,
                     }
                 });
-                if still_staged && crate::texture::fingerprint(at, len) == print {
+                let same = crate::texture::fingerprint(at, len) == print;
+                if still_staged && same {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     // Past the schedule: looked at again every last interval
                     // for as long as the slot shows it. In play1 an eighth of
@@ -1756,23 +1772,21 @@ impl State {
                     let last = RECHECK_FRAMES.len() - 1;
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            let checked = crate::descriptor::host::Checked { looks: looks + 1, ..checked };
+                            host.texture_slot_recheck(index, write, frame + wait, checked)
                         }
-                        None if forever => host.texture_slot_recheck(
-                            index,
-                            write,
-                            frame + RECHECK_FRAMES[last],
-                            (at, len),
-                            print,
-                            looks,
-                            uploaded,
-                        ),
+                        None if forever => {
+                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[last], checked)
+                        }
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
-                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-                if n < 200 || n.is_multiple_of(1000) {
+                if same {
+                    HEAP_TEXTURES_RECHECKED[2].fetch_add(1, Ordering::Relaxed);
+                }
+                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(u64::from(!same), Ordering::Relaxed);
+                if !same && (n < 200 || n.is_multiple_of(1000)) {
                     tracing::warn!(
                         slot = index,
                         address = format_args!("{at:#x}"),
@@ -1900,7 +1914,9 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    let copy = crate::resource::copy_serial(resource);
+                    let checked = crate::descriptor::host::Checked { at, len, print, looks: 0, uploaded: frame, copy };
+                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], checked);
                 }
                 None => host.texture_slot_done(index, write, again),
             }

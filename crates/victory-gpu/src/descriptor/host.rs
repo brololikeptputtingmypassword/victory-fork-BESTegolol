@@ -293,10 +293,32 @@ struct Waiting {
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
     /// For a slot uploaded whole and looked at again
-    /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
-    /// the fingerprint it had at the upload, how many looks found it
-    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
-    checked: (u64, u64, u64, u8, u64),
+    /// ([`TextureQueue::recheck`]); a fingerprint of 0: none.
+    checked: Checked,
+}
+
+/// What an upload of a whole texture picked by index left to compare a later
+/// look at it with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Checked {
+    /// Where its memory is: address and bytes.
+    pub(crate) at: u64,
+    pub(crate) len: u64,
+    /// The memory's fingerprint at the upload (`crate::texture::fingerprint`).
+    pub(crate) print: u64,
+    /// Looks that found it unchanged.
+    pub(crate) looks: u8,
+    /// The frame of the upload.
+    pub(crate) uploaded: u64,
+    /// The host texture uploaded to (`crate::resource::copy_serial`).
+    pub(crate) copy: u64,
+}
+
+/// Looks at textures uploaded already come after the first uploads;
+/// `VICTORY_RECHECK_LAST=0`: before them, as before.
+fn recheck_last() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_LAST").is_none_or(|v| v != "0"))
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -319,7 +341,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: Checked::default() });
     }
 
     fn remove(&mut self, index: u32) {
@@ -335,12 +357,24 @@ impl TextureQueue {
     ///   turns: slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    ///   first 3D frames);
+    /// - last the ones uploaded whole and only looked at again
+    ///   ([`recheck_last`]).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        let mut checks: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.checked.print != 0 && recheck_last() {
+                // The one due longest comes first: a pass that stops at its
+                // budget gets to all of them in turn.
+                checks.push((w.due, index, w.write));
+                continue;
+            } else if w.looks > 0 || w.mapped > 0 {
+                &mut again
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
@@ -357,6 +391,8 @@ impl TextureQueue {
                 order.push((fresh[old].1, fresh[old].2));
             }
         }
+        checks.sort_unstable();
+        order.extend(checks.iter().map(|&(_, index, write)| (index, write)));
         order.truncate(max);
         order
     }
@@ -390,22 +426,20 @@ impl TextureQueue {
         }
     }
 
-    /// Slot `index` was uploaded whole from memory `at` (address, bytes)
-    /// with fingerprint `print`: looked at again from frame `due`, for a
-    /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame).
-    #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    /// Slot `index` was uploaded whole, as `checked` says: looked at again
+    /// from frame `due`, for a title that fills a texture's memory after it
+    /// wrote the view.
+    fn recheck(&mut self, index: u32, write: u64, due: u64, checked: Checked) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+            w.checked = checked;
         }
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    fn checked(&self, index: u32) -> Option<Checked> {
+        self.slots.get(&index).map(|w| w.checked).filter(|c| c.print != 0)
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -416,7 +450,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: Checked::default() });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -427,10 +461,16 @@ impl TextureQueue {
 
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+    /// part; the frames the oldest due one that is not uploaded whole has
+    /// waited since its write; and uploaded whole, to be looked at again.
+    /// (The last were counted as waiting for their memory, and as due.)
+    fn census(&self, frame: u64) -> [u64; 6] {
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
         for w in self.slots.values() {
+            if w.checked.print != 0 {
+                c[5] += 1;
+                continue;
+            }
             if w.mapped > 0 {
                 c[3] += 1;
             } else if w.looks > 0 {
@@ -1006,7 +1046,7 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
@@ -1024,23 +1064,13 @@ impl HostHeap {
     }
 
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slot_recheck(
-        &self,
-        index: u32,
-        write: u64,
-        due: u64,
-        at: (u64, u64),
-        print: u64,
-        looks: u8,
-        uploaded: u64,
-    ) {
+    pub(crate) fn texture_slot_recheck(&self, index: u32, write: u64, due: u64, checked: Checked) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, checked);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<Checked> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
@@ -2704,7 +2734,7 @@ mod tests {
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
         assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        assert_eq!(q.census(9), [9, 9, 0, 0, 8, 0]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
         let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
@@ -2743,6 +2773,32 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A slot uploaded whole is looked at again after every first upload,
+    /// is not counted as waiting for its memory, and starts over when the
+    /// title writes it or its memory changes.
+    #[test]
+    fn the_texture_queue_looks_again_after_first_uploads() {
+        let mut q = TextureQueue::default();
+        for slot in 1..=4u32 {
+            q.written(slot, 1, 0, false);
+        }
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let checked = Checked { at: 0x1000, len: 512, print: 7, looks: 0, uploaded: 2, copy: 3 };
+        for slot in [1, 2, 3] {
+            q.recheck(slot, write(&q, slot), 6 - u64::from(slot), checked);
+        }
+        assert_eq!(q.checked(1), Some(checked));
+        assert!(!q.due(2, 100).iter().any(|d| d.0 != 4));
+        // Slot 4's first upload, then the looks, the one due longest first.
+        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        assert_eq!(order, [4, 3, 2, 1]);
+        assert_eq!(q.census(9), [4, 1, 0, 0, 8, 3]);
+        q.changed(1, 9, 10);
+        q.written(2, 9, 0, false);
+        assert_eq!((q.checked(1), q.checked(2), q.checked(3)), (None, None, Some(checked)));
+        assert_eq!(q.census(10)[5], 1);
     }
 
     /// A view written over memory that older views describe otherwise

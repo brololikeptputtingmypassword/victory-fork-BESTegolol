@@ -1125,6 +1125,8 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// Which host texture it is, counted from 1 over the run ([`copy_serial`]).
+    serial: u64,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1581,6 +1583,7 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
@@ -1589,8 +1592,21 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            serial: SERIAL.fetch_add(1, Relaxed) + 1,
         }
     }
+}
+
+/// Which host texture title texture `this` has now, 0 if none is made: a
+/// copy let go ([`let_go_idle`]) and made anew, empty, has another number.
+/// Not a use of it.
+#[cfg(windows)]
+pub(crate) fn copy_serial(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    let made = resource(this).host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map_or(0, |(host, _)| host.serial)
 }
 
 #[cfg(windows)]

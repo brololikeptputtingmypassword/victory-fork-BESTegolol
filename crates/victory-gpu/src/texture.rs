@@ -882,10 +882,14 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
-/// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// (a texture streams in whole mips; the small ones lie first) and the first
+/// KiB of each 32 (`VICTORY_RECHECK_FINE=0`: not those). Read through the
+/// kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 16 << 10;
+    const PIECE: usize = 1 << 10;
+    static FINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fine = *FINE.get_or_init(|| std::env::var_os("VICTORY_RECHECK_FINE").is_none_or(|v| v != "0"));
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -905,6 +909,11 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
             take(0, WINDOW);
             take((len / 2) & !0xfff, WINDOW);
             take(len - WINDOW, WINDOW);
+            // And a little of each 32 KiB: a texture over the windows filled
+            // in between would look unchanged.
+            for from in (0..len - PIECE).step_by(32 << 10).filter(|_| fine) {
+                take(from, PIECE);
+            }
         }
     });
     let hash = hasher.finalize();
