@@ -386,6 +386,8 @@ impl Hub {
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source);
         hub.poll();
+        #[cfg(all(windows, feature = "diagnostics"))]
+        victory_gpu::control::start();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(POLL);
@@ -458,7 +460,13 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            #[allow(unused_mut)]
+            let mut pad = fallback(&keys);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            host::driven(&mut pad);
+            Value::Pad(pad)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1158,6 +1166,10 @@ mod host {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            if slot == 0 {
+                driven(&mut pad);
+            }
             Some(pad)
         }
 
@@ -1235,6 +1247,44 @@ mod host {
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
+    }
+
+    /// What commands hold down (`victory_gpu::control`), on top of `pad`.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn driven(pad: &mut PadState) {
+        let Some(held) = victory_gpu::control::pad() else { return };
+        for name in &held.buttons {
+            pad.buttons |= match name.as_str() {
+                "menu" => MENU,
+                "view" => VIEW,
+                "a" => A,
+                "b" => B,
+                "x" => X,
+                "y" => Y,
+                "up" => UP,
+                "down" => DOWN,
+                "left" => LEFT,
+                "right" => RIGHT,
+                "lb" => LEFT_SHOULDER,
+                "rb" => RIGHT_SHOULDER,
+                "ls" => LEFT_STICK,
+                "rs" => RIGHT_STICK,
+                _ => 0,
+            };
+        }
+        let axes = [
+            &mut pad.left_trigger,
+            &mut pad.right_trigger,
+            &mut pad.left_x,
+            &mut pad.left_y,
+            &mut pad.right_x,
+            &mut pad.right_y,
+        ];
+        for (axis, held) in axes.into_iter().zip(held.axes) {
+            if held != 0.0 {
+                *axis = held;
+            }
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

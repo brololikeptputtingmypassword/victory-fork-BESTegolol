@@ -396,7 +396,39 @@ const RECHECK_MS: [u64; 5] = [130, 400, 1300, 4000, 13000];
 
 fn recheck_ms() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_MS").is_some_and(|v| v != "0"))
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_MS").is_some_and(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::control::switch("recheck_ms", on);
+    on
+}
+
+/// Textures picked by index of which only a part is mapped are uploaded again
+/// when that part changed or their host copy was made anew, as whole ones are
+/// (`VICTORY_RECHECK_PART=1`): until then they kept what the first upload found
+/// for as long as no more of them was mapped. Streamed textures stay without
+/// their largest mips on purpose.
+fn recheck_part() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_PART").is_some_and(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::control::switch("recheck_part", on);
+    on
+}
+
+/// Textures uploaded in part that such a look found unchanged, changed, and
+/// with their host copy made anew.
+pub(crate) static HEAP_TEXTURES_PART_CHECKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// For the control channel: slot `index`, which shows `resource`, was uploaded.
+#[cfg(feature = "diagnostics")]
+fn note_upload(index: u32, resource: This, frame: u64, whole: bool, tabled: bool) {
+    if crate::control::folder().is_some()
+        && let Some((at, len)) = crate::texture::staged_memory(resource)
+    {
+        let print = crate::texture::fingerprint(at, len);
+        let copy = crate::resource::copy_serial(resource);
+        crate::control::uploaded(index, crate::control::Upload { at, len, print, copy, frame, whole, tabled });
+    }
 }
 
 /// Frames to the `i`-th recheck look, by frames or by the clock with
@@ -1684,6 +1716,8 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        #[cfg(feature = "diagnostics")]
+        crate::control::heaps(heap, host);
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -1834,8 +1868,32 @@ impl State {
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
-                        continue;
+                        // The part that is there may hold something else by
+                        // now, or its host copy may be a new, empty one.
+                        let changed = recheck_part()
+                            && host.texture_slot_part(index).is_some_and(|was| {
+                                let copy = heap
+                                    .handle(index)
+                                    .and_then(crate::descriptor::view)
+                                    .and_then(|v| crate::descriptor::host::placed_texture(&v))
+                                    .map_or(0, |v| match v {
+                                        View::Shader(object, _) => crate::resource::copy_serial(object as This),
+                                        _ => 0,
+                                    });
+                                let what = if crate::texture::fingerprint(was.at, was.len) != was.print {
+                                    1
+                                } else if recheck_copy() && copy != was.copy {
+                                    2
+                                } else {
+                                    0
+                                };
+                                HEAP_TEXTURES_PART_CHECKED[what].fetch_add(1, Ordering::Relaxed);
+                                what != 0
+                            });
+                        if !changed {
+                            host.texture_slot_later(index, write, frame, most);
+                            continue;
+                        }
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
@@ -1914,6 +1972,8 @@ impl State {
                 // next draw that reads the texture through a table stage,
                 // detile and upload all of it once more.
                 HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                note_upload(index, resource, frame, again.is_none(), true);
                 host.texture_slot_done(index, write, again);
                 continue;
             }
@@ -1927,6 +1987,17 @@ impl State {
             } else {
                 None
             };
+            // (Driven by commands, the switch may be turned on later.)
+            #[cfg(feature = "diagnostics")]
+            let noted = recheck_part() || crate::control::folder().is_some();
+            #[cfg(not(feature = "diagnostics"))]
+            let noted = recheck_part();
+            let part = match partly {
+                Some(_) if noted => crate::texture::staged_memory(resource),
+                _ => None,
+            };
+            #[cfg(feature = "diagnostics")]
+            note_upload(index, resource, frame, again.is_none(), false);
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
@@ -1939,7 +2010,15 @@ impl State {
                     let checked = crate::descriptor::host::Checked { at, len, print, looks: 0, uploaded: frame, copy };
                     host.texture_slot_recheck(index, write, frame + recheck_wait(0, took), checked);
                 }
-                None => host.texture_slot_done(index, write, again),
+                None => {
+                    host.texture_slot_done(index, write, again);
+                    if let Some((at, len)) = part {
+                        let print = crate::texture::fingerprint(at, len);
+                        let copy = crate::resource::copy_serial(resource);
+                        let part = crate::descriptor::host::Checked { at, len, print, looks: 0, uploaded: frame, copy };
+                        host.texture_slot_set_part(index, write, part);
+                    }
+                }
             }
         }
     }

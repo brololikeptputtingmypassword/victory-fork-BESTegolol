@@ -50,6 +50,25 @@ pub(crate) fn listed(n: u64) -> bool {
     named
         || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
         || HEAVY_NEXT.load(std::sync::atomic::Ordering::Relaxed) == n
+        || {
+            use std::sync::atomic::Ordering::Relaxed;
+            n.wrapping_sub(ASKED[0].load(Relaxed)) < ASKED[1].load(Relaxed)
+        }
+}
+
+/// The first frame a command asked for (`crate::control`), and how many.
+static ASKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The frame whose picture alone a command asked for.
+pub(crate) static SHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `frames` frames from `first` on are captured.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn next(first: u64, frames: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    ASKED[1].store(0, Relaxed);
+    ASKED[0].store(first, Relaxed);
+    ASKED[1].store(frames, Relaxed);
 }
 
 /// The frame to capture next for `VICTORY_CAPTURE_HEAVY`.
@@ -185,7 +204,8 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    let shot = SHOT.load(std::sync::atomic::Ordering::Relaxed) == n;
+    folder().is_some() && (shot || n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -479,6 +499,15 @@ fn dump_one(
                 (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+        }
+        // Small targets of floats also as they are: rows of `pitch` bytes (in
+        // the file's name), with nothing scaled (the picture's values are).
+        if matches!(f.Format.0, 1..=2 | 9..=10 | 16 | 26 | 33..=34 | 41 | 54)
+            && f.Width * f.Height <= 640 * 360
+            && let Some(folder) = folder()
+        {
+            let name = format!("frame-{frame}-{i}-{resource:?}-{}x{}-f{}-p{pitch}.raw", f.Width, f.Height, f.Format.0);
+            let _ = std::fs::write(folder.join(name), rows);
         }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(

@@ -6040,6 +6040,13 @@ impl Meter {
                 tracing::info!(
                     "textures picked by index, looks at uploaded ones since the start: {same_memory} unchanged, {changed} changed and {remade} of a host copy made anew (both uploaded again)"
                 );
+                let [same_memory, changed, remade] =
+                    crate::draw::HEAP_TEXTURES_PART_CHECKED.each_ref().map(|c| c.load(Ordering::Relaxed));
+                if same_memory + changed + remade > 0 {
+                    tracing::info!(
+                        "textures picked by index, looks at those uploaded in part since the start (VICTORY_RECHECK_PART=1): {same_memory} unchanged, {changed} changed and {remade} of a host copy made anew (both uploaded again)"
+                    );
+                }
                 let [queued, due, away, partly, oldest, uploaded] =
                     [0, 1, 2, 3, 4, 5].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =

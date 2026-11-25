@@ -295,6 +295,8 @@ struct Waiting {
     /// For a slot uploaded whole and looked at again
     /// ([`TextureQueue::recheck`]); a fingerprint of 0: none.
     checked: Checked,
+    /// What the last upload in part left (`mapped` is not 0 then).
+    part: Checked,
 }
 
 /// What an upload of a whole texture picked by index left to compare a later
@@ -341,7 +343,8 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: Checked::default() });
+        let (checked, part) = (Checked::default(), Checked::default());
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked, part });
     }
 
     fn remove(&mut self, index: u32) {
@@ -423,7 +426,23 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            (w.checked, w.part) = (Checked::default(), Checked::default());
         }
+    }
+
+    /// What the upload in part of slot `index` left, to compare a later look
+    /// with.
+    fn set_part(&mut self, index: u32, write: u64, part: Checked) {
+        if let Some(w) = self.same(index, write)
+            && w.mapped > 0
+        {
+            w.part = part;
+        }
+    }
+
+    /// What [`TextureQueue::set_part`] noted, if anything.
+    fn part(&self, index: u32) -> Option<Checked> {
+        self.slots.get(&index).map(|w| w.part).filter(|c| c.print != 0)
     }
 
     /// Slot `index` was uploaded whole, as `checked` says: looked at again
@@ -450,13 +469,20 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: Checked::default() });
+        let (checked, part) = (Checked::default(), Checked::default());
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked, part });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
     /// (0: not uploaded, or all of it was).
     fn mapped(&self, index: u32) -> u64 {
         self.slots.get(&index).map_or(0, |w| w.mapped)
+    }
+
+    /// What is known of slot `index`, for the control channel.
+    #[cfg(feature = "diagnostics")]
+    fn state(&self, index: u32) -> String {
+        self.slots.get(&index).map_or("none".into(), |w| format!("{w:?}"))
     }
 
     /// For the frame line: slots in the queue; of them due at `frame`;
@@ -1069,6 +1095,12 @@ impl HostHeap {
         textures.recheck(index, write, due, checked);
     }
 
+    /// See [`TextureQueue::state`].
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn texture_slot_state(&self, index: u32) -> String {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).state(index)
+    }
+
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<Checked> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
@@ -1080,6 +1112,16 @@ impl HostHeap {
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.later(index, write, frame, most);
+    }
+
+    /// See [`TextureQueue::set_part`].
+    pub(crate) fn texture_slot_set_part(&self, index: u32, write: u64, part: Checked) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).set_part(index, write, part);
+    }
+
+    /// See [`TextureQueue::part`].
+    pub(crate) fn texture_slot_part(&self, index: u32) -> Option<Checked> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).part(index)
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
@@ -2637,6 +2679,27 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_an_upload_in_part_left() {
+        let mut q = TextureQueue::default();
+        q.written(3, 0, 0, false);
+        let write = q.due(0, 8)[0].1;
+        let part = Checked { at: 1, len: 2, print: 9, looks: 0, uploaded: 0, copy: 4 };
+        // Not before an upload in part.
+        q.set_part(3, write, part);
+        assert_eq!(q.part(3), None);
+        q.partly(3, write, 1, 64);
+        q.set_part(3, write, part);
+        assert_eq!(q.part(3), Some(part));
+        // Looks keep it, the slot is not one uploaded whole; a new write drops it.
+        q.later(3, write, 1, 8);
+        assert_eq!(q.part(3), Some(part));
+        assert_eq!(q.checked(3), None);
+        assert_eq!(q.census(9)[3], 1);
+        q.changed(3, 9, 10);
+        assert_eq!(q.part(3), None);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
