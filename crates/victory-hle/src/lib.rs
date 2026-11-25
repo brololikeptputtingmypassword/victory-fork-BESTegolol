@@ -124,6 +124,7 @@ mod tests {
 
 /// Stacks of every thread when frames stall (`VICTORY_STALL_STACKS`, see
 /// [`victory_loader::dump_stacks_on_stall`]).
+#[cfg(all(windows, feature = "diagnostics"))]
 pub fn dump_stacks_on_stall() {
     victory_loader::dump_stacks_on_stall(victory_gpu::frame::current);
 }
