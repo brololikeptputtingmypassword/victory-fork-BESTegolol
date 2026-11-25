@@ -2150,6 +2150,70 @@ fn bytes_from(resource: &[u32; 14], mip: u32, all: u64) -> u64 {
     }
 }
 
+/// Host copies of placed textures begin at the first mip their view shows
+/// ([`from_mip`]): `VICTORY_MIP_COPIES=1`.
+#[cfg(windows)]
+fn mip_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIP_COPIES").is_some_and(|v| v != "0"))
+}
+
+/// The texture that `resource` is from the first mip on that its 2D view
+/// `desc` shows, and how many mips are left out: it lies at the same
+/// address, as the smaller mips lie first. The larger ones are never
+/// uploaded for such a view, but a host copy of all of `resource` holds
+/// room for them on the card (at a run's cell scene 5.2 GB where 1.3 GB are
+/// shown). `None`: all of it is taken.
+/// Only block-compressed textures of one slice: nothing the host renders
+/// to is one ([`alias_of`]).
+#[cfg(windows)]
+pub(crate) fn from_mip(resource: &[u32; 14], desc: &[u32; 16]) -> Option<([u32; 14], u32)> {
+    const VIEW_2D: u32 = 4;
+    if !mip_copies() || desc[1] != VIEW_2D || desc[4] == 0 {
+        return None;
+    }
+    type Known = std::collections::HashMap<([u32; 14], u32), Option<([u32; 14], u32)>>;
+    static KNOWN: std::sync::Mutex<Option<Known>> = std::sync::Mutex::new(None);
+    let mut key = (*resource, desc[4]);
+    (key.0[1], key.0[13]) = (0, 0);
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    *known.get_or_insert_default().entry(key).or_insert_with(|| reduced(&key.0, key.1))
+}
+
+/// [`from_mip`]: as few mips of `resource` as lie in memory as a texture's
+/// of their own do, mip `first` and the smaller ones among them.
+#[cfg(windows)]
+fn reduced(resource: &[u32; 14], first: u32) -> Option<([u32; 14], u32)> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { resource.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == TEXTURE_3D
+        || d.depth_or_array_size != 1
+        || d.sample_count > 1
+        || element(d.format).is_none_or(|(_, block)| block != 4)
+    {
+        return None;
+    }
+    let whole = texture_layout(&d)?;
+    let [plane] = whole.planes.as_slice() else { return None };
+    (1..=first.min(u32::from(d.mip_levels).checked_sub(1)?)).rev().find_map(|mip| {
+        let (width, height) = (d.width >> mip, d.height >> mip);
+        // The host takes no compressed texture of part of a block.
+        if width == 0 || height == 0 || width % 4 != 0 || height % 4 != 0 {
+            return None;
+        }
+        let small = ResourceDesc { width, height, mip_levels: d.mip_levels - mip as u16, ..d };
+        let layout = texture_layout(&small)?;
+        let [of] = layout.planes.as_slice() else { return None };
+        if !plane.layout.holds_from(mip, &of.layout) {
+            return None;
+        }
+        let mut words = *resource;
+        (words[4], words[5], words[6]) = (width as u32, (width >> 32) as u32, height);
+        words[7] = 1 | u32::from(small.mip_levels) << 16;
+        Some((words, mip))
+    })
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
@@ -2391,6 +2455,30 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn a_placed_texture_from_a_later_mip_on() {
+        // 1024x1024 BC7, 11 mips, 4 KiB blocks.
+        let texture = [3, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let (small, mips) = reduced(&texture, 2).unwrap();
+        assert_eq!(mips, 2);
+        assert_eq!(small, [3, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0]);
+        assert_eq!(placed_bytes(&small), Some(bytes_from(&texture, 2, u64::MAX)));
+        // In the tail: from its first mip on.
+        let (small, mips) = reduced(&texture, 9).unwrap();
+        assert_eq!((small[4], small[7] >> 16), (1024 >> mips, 11 - mips));
+        assert!(mips >= 2 && mips < 9);
+        // All of it; targets' formats; arrays; parts of blocks.
+        assert_eq!(reduced(&texture, 0), None);
+        let with = |word: usize, to: u32| {
+            let mut t = texture;
+            t[word] = to;
+            t
+        };
+        assert_eq!(reduced(&with(8, 28), 2), None);
+        assert_eq!(reduced(&with(7, 0xb_0006), 2), None);
+        assert_eq!(reduced(&with(6, 1), 2), None);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

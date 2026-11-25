@@ -1098,7 +1098,13 @@ impl HostHeap {
     /// was brought up to date: due again from frame `again` (uploaded with
     /// that many bytes of its memory there, not all), or not until the
     /// slot is written again.
+    #[track_caller]
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
+        #[cfg(feature = "diagnostics")]
+        if again.is_none() {
+            let at = std::panic::Location::caller();
+            crate::control::left(index, || format!("done at {at}"));
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
@@ -1237,6 +1243,8 @@ impl HostHeap {
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
+                    #[cfg(feature = "diagnostics")]
+                    crate::control::left(index, || "read through a table".to_owned());
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -1281,6 +1289,10 @@ impl HostHeap {
             };
             textures.written(index, frame, due, seen);
         } else {
+            #[cfg(feature = "diagnostics")]
+            if textures.slots.contains_key(&index) {
+                crate::control::left(index, || format!("texture {texture}, read now {read_now}, seen {seen}"));
+            }
             textures.remove(index);
         }
     }
@@ -1366,6 +1378,8 @@ impl HostHeap {
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &slot in &stale {
                 textures.remove(slot);
+                #[cfg(feature = "diagnostics")]
+                crate::control::left(slot, || format!("made stale by a write of slot {index}: {view:?}"));
             }
         }
         let stride = view.and_then(view_stride);
@@ -2527,8 +2541,18 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let mut words: [u32; 10] = desc[..10].try_into().ok()?;
+    let resource = match crate::resource::from_mip(resource, desc) {
+        Some((small, mips)) => {
+            // The view's first mip, and the least one it may read (a float).
+            words[4] -= mips;
+            words[7] = (f32::from_bits(words[7]) - mips as f32).max(0.0).to_bits();
+            small
+        }
+        None => *resource,
+    };
+    let texture = crate::resource::texture_at(address, &resource)?;
+    Some(View::Shader(texture as usize, Some(words)))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

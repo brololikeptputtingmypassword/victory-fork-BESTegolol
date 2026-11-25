@@ -267,6 +267,17 @@ pub(crate) fn uploaded(index: u32, upload: Upload) {
 }
 
 /// The texture object a slot's view shows.
+/// Why title slots left the queue of textures picked by index, last.
+static LEFT: std::sync::Mutex<Option<std::collections::HashMap<u32, (u64, String)>>> = std::sync::Mutex::new(None);
+
+/// Title slot `index` leaves that queue.
+pub(crate) fn left(index: u32, why: impl FnOnce() -> String) {
+    if folder().is_some() {
+        let mut left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+        left.get_or_insert_default().insert(index, (crate::queue::presented(), why()));
+    }
+}
+
 fn object(view: View) -> Option<This> {
     match crate::descriptor::host::placed_texture(&view).unwrap_or(view) {
         View::Shader(resource, _) => Some(resource as This),
@@ -298,6 +309,9 @@ fn slot(index: u32) -> String {
             let _ = write!(text, "; uploaded {u:x?} at frame {}, memory {}", u.frame, if same { "as then" } else { "CHANGED" });
         }
         None => text.push_str("; never uploaded by the pass"),
+    }
+    if let Some((frame, why)) = LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&index)) {
+        let _ = write!(text, "; left the queue at frame {frame}: {why}");
     }
     text
 }

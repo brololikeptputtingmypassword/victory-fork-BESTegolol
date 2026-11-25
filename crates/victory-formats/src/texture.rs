@@ -534,6 +534,17 @@ impl Layout {
         }
     }
 
+    /// Whether `small` places its mips as this places its own from mip
+    /// `mip` on, in both cases from the start of a slice.
+    pub fn holds_from(&self, mip: u32, small: &Layout) -> bool {
+        mip <= self.first_tail_mip
+            && self.mips.get(mip as usize..) == Some(&small.mips[..])
+            && self.first_tail_mip - mip == small.first_tail_mip
+            && self.bytes_from(mip) == small.slice_size
+            && (self.block, self.thick, self.slices) == (small.block, small.thick, small.slices)
+            && self.pattern == small.pattern
+    }
+
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {
@@ -915,6 +926,32 @@ mod tests {
         bc1.swizzle = Swizzle::LINEAR;
         let l = Layout::new(&bc1).unwrap();
         assert_eq!(l.bytes_from(3), l.slice_size);
+    }
+
+    /// Without its largest mips a texture lies as one that never had them,
+    /// down to the first mip of the tail.
+    #[test]
+    fn a_texture_without_its_larger_mips_lies_the_same() {
+        let mut bc1 = desc(1024, 1024, 11, 8, Swizzle::SW_64KB_D_X);
+        bc1.block = 4;
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D_X, Swizzle::SW_64KB_R_X] {
+            bc1.swizzle = swizzle;
+            let whole = Layout::new(&bc1).unwrap();
+            for mip in 0..=6 {
+                let mut d = bc1;
+                (d.width, d.height, d.mips) = (1024 >> mip, 1024 >> mip, 11 - mip);
+                let small = Layout::new(&d).unwrap();
+                assert_eq!(whole.holds_from(mip, &small), mip <= whole.first_tail_mip, "{swizzle:?} {mip}");
+            }
+            assert!(whole.first_tail_mip > 0 && whole.first_tail_mip < 6);
+            // Another size is not it.
+            assert!(!whole.holds_from(1, &whole));
+        }
+        bc1.swizzle = Swizzle::LINEAR;
+        let whole = Layout::new(&bc1).unwrap();
+        bc1.mips = 10;
+        (bc1.width, bc1.height) = (512, 512);
+        assert!(!whole.holds_from(1, &Layout::new(&bc1).unwrap()));
     }
 
     #[test]
