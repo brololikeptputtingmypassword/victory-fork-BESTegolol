@@ -47,7 +47,29 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+        || HEAVY_NEXT.load(std::sync::atomic::Ordering::Relaxed) == n
+}
+
+/// The frame to capture next for `VICTORY_CAPTURE_HEAVY`.
+static HEAVY_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `VICTORY_CAPTURE_HEAVY` (comma-separated, with `VICTORY_CAPTURE_WORLD`):
+/// the 2nd frame after the n-th one that ran 3000 draws or more is captured
+/// too. (Frames counted from the first of the world say little: the title
+/// shows black and loading pictures in between, at 30 a second.)
+fn heavy_drew(frame: u64, draws: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let list = LIST.get_or_init(|| {
+        let list = std::env::var("VICTORY_CAPTURE_HEAVY").unwrap_or_default();
+        list.split(',').filter_map(|f| f.trim().parse().ok()).collect()
+    });
+    if draws >= 3000 && list.contains(&(COUNT.fetch_add(1, Relaxed) + 1)) {
+        HEAVY_NEXT.store(frame + 2, Relaxed);
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -128,6 +150,17 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    heavy_drew(frame, drawn.saturating_sub(before));
+    #[cfg(feature = "diagnostics")]
+    {
+        // The title records ahead: what it recorded while a frame was built
+        // has run some presents later.
+        let of = HISTORY_FRAME.load(Relaxed);
+        if of != u64::MAX && frame >= of + 4 {
+            HISTORY_FRAME.store(u64::MAX, Relaxed);
+            history_dump(of);
+        }
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -362,7 +395,7 @@ pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
-    history_dump(frame);
+    HISTORY_FRAME.store(frame, Relaxed);
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -724,6 +757,10 @@ unsafe impl Send for Rows {}
 #[cfg(feature = "diagnostics")]
 static HISTORY: std::sync::Mutex<Vec<Rows>> = std::sync::Mutex::new(Vec::new());
 
+/// The frame whose history is written out next.
+#[cfg(feature = "diagnostics")]
+static HISTORY_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 #[cfg(feature = "diagnostics")]
 fn history_step() -> Option<u32> {
     static STEP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
@@ -863,7 +900,7 @@ pub(crate) fn history_after(list: &crate::host::HostList, rows: Option<Rows>) {
     }
 }
 
-/// At the dump of frame `frame` (every submission has run): what its draws
+/// Some presents after frame `frame` (its submissions have run): what its draws
 /// changed.
 #[cfg(feature = "diagnostics")]
 fn history_dump(frame: u64) {
