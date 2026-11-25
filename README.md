@@ -134,7 +134,8 @@ for title memory remaps.
   read where not every lane runs"), then a run with `VICTORY_BVH_BUILDER=1` for light in shadow.
 - Start-screen stutter: a shorter pipeline wait, and pipelines a frame needs ahead of the
   background prewarm queue.
-- Loading time, and textures held back by the VRAM budget (~12,000 waiting in the world).
+- Loading time. Textures held back by the VRAM budget: fixed by letting the sweep free textures
+  only the view cache held (e5e4be6) plus `VICTORY_TEXTURE_BUDGET_MB=8000` (queue ~12,000 -> under 100).
 - Frame time: copy-back and the per-frame heap-buffer pass are the biggest CPU costs.
 - Green surfaces; dark scenes (no ray-traced bounce light until the builder runs); three
   64-lane compute programs (light/fog volume among them) still refused on 32-lane GPUs.
