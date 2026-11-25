@@ -6068,6 +6068,12 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                let left = crate::descriptor::host::STALE[5].load(Ordering::Relaxed);
+                if left > 0 {
+                    tracing::info!(
+                        "looks at stale slots whose memory changed, left as uploaded, since the start (VICTORY_STALE_KEEP=1): {left}"
+                    );
+                }
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(

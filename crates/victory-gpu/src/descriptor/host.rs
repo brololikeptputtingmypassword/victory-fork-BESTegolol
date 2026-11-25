@@ -127,6 +127,17 @@ impl Spans {
         bytes
     }
 
+    /// Where the texture ends that a placed view at `start` is of, and up to
+    /// where the view shows it: start, shown, end.
+    fn span(&mut self, resource: &[u32; 14], desc: &[u32; 16], start: u64) -> Option<(u64, u64, u64)> {
+        let end = start.saturating_add(self.bytes(resource)?);
+        let shown = match crate::resource::mip_spans() {
+            true => start.saturating_add(crate::resource::placed_view_bytes(resource, desc)?),
+            false => end,
+        };
+        Some((start, shown, end))
+    }
+
     /// The starts of the spans that overlap `[start, end)`.
     fn overlapping(&self, start: u64, end: u64) -> Vec<u64> {
         let before = self
@@ -184,6 +195,17 @@ impl Spans {
         stale
     }
 
+    /// Whether slot `index`, of a view as [`Spans::note`] says, is stale
+    /// and newer views still describe the memory it shows. A stale slot of
+    /// memory nothing else describes is noted again.
+    fn covered(&mut self, index: u32, start: u64, shown: u64, end: u64) -> bool {
+        if self.by_slot.contains_key(&index) {
+            return false;
+        }
+        let _ = self.note(index, start, shown, end, false);
+        !self.by_slot.contains_key(&index)
+    }
+
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
         let Some(start) = self.by_slot.remove(&index) else {
@@ -222,9 +244,22 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
 /// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
-pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// ranges; made slots whose memory was found unmapped (made null); and
+/// looks that left a stale slot whose memory changed as it was uploaded.
+pub(crate) static STALE: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether a stale slot goes on showing what it was uploaded with, and
+/// stays in the queue: `VICTORY_STALE_KEEP=1`. The title writes views of
+/// whole textures over memory others have (all of a texture whose larger
+/// mips are not there, for a while), and goes on showing those: 449 of the
+/// 1,876 textures the materials of a cell scene named read nothing, 351 of
+/// them with their memory as it was uploaded, and none with a newer view
+/// there still. Uploaded again only once no newer view describes its memory.
+pub(crate) fn stale_keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_KEEP").is_some_and(|v| v != "0"))
+}
 
 /// Whether a view written over memory that older views describe otherwise
 /// makes those stale; `VICTORY_STALE_TEXTURES=0` leaves them as they are.
@@ -1112,6 +1147,18 @@ impl HostHeap {
         }
     }
 
+    /// See [`Spans::covered`]; `view`: what slot `index` holds.
+    pub(crate) fn texture_slot_covered(&self, index: u32, view: &View) -> bool {
+        let View::Placed(false, resource, desc) = view else {
+            return false;
+        };
+        let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+        let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        placed
+            .span(resource, desc, start)
+            .is_some_and(|(start, shown, end)| placed.covered(index, start, shown, end))
+    }
+
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
     pub(crate) fn texture_slot_recheck(&self, index: u32, write: u64, due: u64, checked: Checked) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
@@ -1350,17 +1397,10 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let mut stale = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let span = placed_view.and_then(|(resource, desc, start)| {
-                let end = start.saturating_add(placed.bytes(resource)?);
-                let shown = match crate::resource::mip_spans() {
-                    true => start.saturating_add(crate::resource::placed_view_bytes(resource, desc)?),
-                    false => end,
-                };
-                Some((start, shown, end))
-            });
+            let span = placed_view.and_then(|(resource, desc, start)| placed.span(resource, desc, start));
             match span {
                 Some((start, shown, end)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
@@ -1375,6 +1415,9 @@ impl HostHeap {
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if stale_keep() {
+                stale.clear();
+            }
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &slot in &stale {
                 textures.remove(slot);
@@ -2956,6 +2999,21 @@ mod tests {
         assert_eq!(spans.slots_in(0, u64::MAX), [3, 4, 2]);
         assert_eq!(spans.note(3, 0x1000, 0x9000, 0x9000, true), [4, 2]);
         assert_eq!(spans.slots_in(0, u64::MAX), [3]);
+    }
+
+    /// A stale slot is covered for as long as a newer view is there, and
+    /// noted again after.
+    #[test]
+    fn a_stale_slot_is_covered_while_the_newer_view_is_there() {
+        let mut spans = Spans::default();
+        assert!(spans.note(1, 0x3000, 0x4000, 0x4000, true).is_empty());
+        assert!(!spans.covered(1, 0x3000, 0x4000, 0x4000));
+        assert_eq!(spans.note(2, 0x1000, 0x9000, 0x9000, true), [1]);
+        assert!(spans.covered(1, 0x3000, 0x4000, 0x4000));
+        // The newer shows less of its texture now, or is another's.
+        assert!(spans.note(2, 0x1000, 0x2000, 0x9000, true).is_empty());
+        assert!(!spans.covered(1, 0x3000, 0x4000, 0x4000));
+        assert_eq!(spans.slots_in(0, u64::MAX), [2, 1]);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due

@@ -1838,6 +1838,20 @@ impl State {
                     }
                     continue;
                 }
+                // A newer view describes the changed memory otherwise: the
+                // slot goes on showing what it was uploaded with.
+                if !same
+                    && crate::descriptor::host::stale_keep()
+                    && heap
+                        .handle(index)
+                        .and_then(crate::descriptor::view)
+                        .is_some_and(|view| host.texture_slot_covered(index, &view))
+                {
+                    crate::descriptor::host::STALE[5].fetch_add(1, Ordering::Relaxed);
+                    let wait = recheck_wait(RECHECK_FRAMES.len() - 1, took);
+                    host.texture_slot_recheck(index, write, frame + wait, checked);
+                    continue;
+                }
                 if same {
                     HEAP_TEXTURES_RECHECKED[2].fetch_add(1, Ordering::Relaxed);
                 }
