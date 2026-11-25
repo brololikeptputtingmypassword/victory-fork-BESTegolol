@@ -18,7 +18,7 @@ Xbox Series title natively on Windows (Direct3D 12) from files the user supplies
 GPU programs (GFX10 machine code) are translated to DXIL; the console's system calls are
 answered on Windows.
 This fork pushes on two things: **the world drawing completely** and **frame rate**.
-Jump to: [current state](#current-state-updated-2026-11-24-evening) ·
+Jump to: [current state](#current-state-updated-2026-11-25) ·
 [what changed](#what-this-fork-changed) · [switches](#recommended-switches) ·
 [next](#next) · [getting started](#getting-started).
 If this helps you, a star helps others find it.
@@ -27,7 +27,7 @@ If this helps you, a star helps others find it.
 copy of the game. Not affiliated with or endorsed by the game's developer or publisher.
 Licensed GPL-3.0-or-later, like everything it is built on.
 
-## Current state (updated 2026-11-24, evening)
+## Current state (updated 2026-11-25)
 
 Tested on: Windows 11, AMD Ryzen 7 5700X, NVIDIA RTX 3060 12 GB, 32 GB RAM.
 
@@ -74,11 +74,26 @@ dark, and walls/floors that are late to appear while the world streams in.
 5. **Translation gaps** (the second session's branch, merged): `v_cvt_f32_f64` and wave
    sums of doubles, `v_fma_mixlo_f16` over interpolation halves, whole-wave sections whose
    ends the compiler merged, a last form for 32-lane hosts, and a retry of cross-lane code
-   with every lane present.
+   with every lane present; signature rows in element order and one interpolation mode per
+   row (six programs the DXIL validator refused).
+6. **Descriptor tables shared between lists** (`descriptor/host.rs`, `draw.rs`): a table
+   without constant buffers is keyed by what its entries name (view record and generation)
+   and made once for every list that binds it; about 43% of tables are now taken instead of
+   made. `VICTORY_SHARED_TABLES=0` turns it off.
+7. **Card-side copy buffers from 1 MB to 3 GB** (`shadow.rs`): snapshots fell from
+   100-230 ms to about 3 ms a frame and copy-back from 190-480 ms to about 50 ms.
+8. **No blending into integer render targets** (`pipeline/host.rs`): D3D12 refuses such a
+   pipeline, so a mesh program writing a `uint` target beside blended colour had none.
+9. **Merged** (2026-11-25): upstream's depth bounds test, texture refetch for characters'
+   skin and hair, and faster defaults; from
+   the VItoriaBr fork (GPL-3.0) a fix for interpolation first halves read
+   outside their pair, and `VICTORY_SHADER_LOOP_LIMIT` in release builds.
 
 ## Recommended switches
 
-Measured with an automatic A/B runner (each setup 7 minutes, frames averaged after loading):
+The copy-back thread (`VICTORY_RELAY=2`), wide copy-back and the larger card buffers are
+now on by default; `Play GTA VI.bat` also sets `VICTORY_PIPELINE_WORKERS=14` and
+`VICTORY_TEXTURE_NO_WAIT=1`. Earlier measurements, with an automatic A/B runner (each setup 7 minutes, frames averaged after loading):
 
 | Setup | avg fps | ms/frame |
 |-------|---------|----------|
@@ -121,7 +136,8 @@ for title memory remaps.
   background prewarm queue.
 - Loading time, and textures held back by the VRAM budget (~12,000 waiting in the world).
 - Frame time: copy-back and the per-frame heap-buffer pass are the biggest CPU costs.
-- Green surfaces; the depth bounds test that host pipelines leave out.
+- Green surfaces; dark scenes (no ray-traced bounce light until the builder runs); three
+  64-lane compute programs (light/fog volume among them) still refused on 32-lane GPUs.
 
 ---
 
