@@ -459,6 +459,41 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Buffer views left null since the start, by why ([`refusal`]): a raw view not starting on
+/// 16 bytes, a typed or structured view not on an element of its host copy, no elements, past
+/// the end of its memory, a format or stride the host has no view for.
+pub(crate) static REFUSED_KINDS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Counts a buffer view of title memory at `address` (`len` bytes) left null as `kind` of
+/// [`REFUSED_KINDS`]; diagnostics builds name the first ones (to find their readers in a
+/// capture's list of operations).
+fn refused(kind: usize, address: u64, len: u64) {
+    REFUSED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        static NAMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if NAMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            tracing::info!(kind, address = format_args!("{address:#x}"), len, "buffer view left null");
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (address, len);
+}
+
+/// Which of [`REFUSED_KINDS`] a view [`buffer_view_ok`] refuses is.
+fn refusal(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, _width: u64) -> usize {
+    if count == 0 {
+        2
+    } else if raw && format == DXGI_FORMAT_R32_TYPELESS && stride == 0 && !first.is_multiple_of(4) {
+        0
+    } else if buffer_view_ok(format, 0, count.min(1), stride, raw, u64::MAX) {
+        3
+    } else {
+        4
+    }
+}
+
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
 /// it.
@@ -1805,6 +1840,7 @@ fn buffer_srv(
                 element,
                 "buffer view not on an element of its host copy"
             );
+            refused(1, address, len);
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -1815,6 +1851,7 @@ fn buffer_srv(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        refused(refusal(desc.Format, first, count, stride, raw, width), address, len);
         once!(
             format = desc.Format.0,
             first,
@@ -1879,6 +1916,7 @@ fn buffer_uav(
     } else {
         if element == 0 || offset % element != 0 {
             once!(offset, element, "unordered buffer view not on an element of its host copy");
+            refused(1, address, len);
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -1895,6 +1933,7 @@ fn buffer_uav(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        refused(refusal(desc.Format, first, count, stride, raw, width), address, len);
         once!(
             format = desc.Format.0,
             first,
