@@ -534,3 +534,27 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         "ran on the hardware device: the inner test's SCC for every lane once some lane is inside"
     );
 }
+
+/// Two host waves read the same from LDS only where every write is behind a barrier and none
+/// can follow.
+#[test]
+fn an_lds_read_is_settled_behind_a_barrier_and_before_no_write() {
+    let write = [0xD834_0000, 0x0000_0100]; // ds_write_b32 v0, v1
+    let read = [0xD8D8_0000, 0x0200_0000]; // ds_read_b32 v2, v0
+    let barrier = [0xBF8A_0000, 0xBF80_0000]; // s_barrier, s_nop 0
+    let settled = |parts: &[[u32; 2]], tail: &[u32]| {
+        let native = native(&[parts.concat(), tail.to_vec()].concat());
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let site = p.blocks.iter().enumerate().find_map(|(b, block)| {
+            let i = block.insts.iter().position(|i| i.name() == "ds_read_b32")?;
+            Some((b, i))
+        });
+        lower::lds_settled(&p, site.expect("the read"))
+    };
+    assert!(settled(&[read], &[]));
+    assert!(settled(&[write, barrier, read], &[]));
+    assert!(!settled(&[write, read], &[]));
+    assert!(!settled(&[barrier, read, write], &[]));
+    // s_cbranch_scc1 back to the write: it can follow the read
+    assert!(!settled(&[write, barrier, read], &[0xBF85_FFF9]));
+}

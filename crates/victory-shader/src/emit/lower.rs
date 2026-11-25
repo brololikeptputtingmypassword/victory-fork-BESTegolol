@@ -503,6 +503,19 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                 {
                     v.src.clone()
                 }
+                // An LDS read at one address gives every lane the same dword, and both host
+                // waves of a console wave read the same one where LDS is settled there
+                // (`lds_settled`): the wave-total a prefix scan keeps in LDS, fetched by a
+                // loop of `v_readfirstlane`s.
+                Fields::Ds {
+                    addr: Some(a),
+                    gds: false,
+                    ..
+                } if matches!(name, "ds_read_b32" | "ds_read_b64" | "ds_read_b96" | "ds_read_b128")
+                    && lds_settled(p, (b, i)) =>
+                {
+                    vec![*a]
+                }
                 _ => continue,
             };
             if st.guards[b][i].is_some() {
@@ -531,6 +544,54 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// Whether LDS holds still for the read at `site`, so the two host waves of a console wave
+/// read the same there however far apart they run: no LDS write or atomic can follow it,
+/// and every one before it is behind an `s_barrier` (which both host waves pass).
+pub(super) fn lds_settled(p: &Program, site: (usize, usize)) -> bool {
+    let writes = |inst: &Inst| {
+        matches!(inst.fields, Fields::Ds { .. }) && {
+            let n = inst.name();
+            !(n.starts_with("ds_read") || n.starts_with("ds_swizzle") || n.contains("permute"))
+        }
+    };
+    // Whether a path from just after `from` meets an instruction `hit` before one `stop`.
+    let reaches = |from: (usize, usize), stop: &dyn Fn(&Inst) -> bool, hit: &dyn Fn((usize, usize), &Inst) -> bool| {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = vec![(from.0, from.1 + 1)];
+        while let Some((b, start)) = stack.pop() {
+            let mut open = true;
+            for (i, inst) in p.blocks[b].insts.iter().enumerate().skip(start) {
+                if hit((b, i), inst) {
+                    return true;
+                }
+                if stop(inst) {
+                    open = false;
+                    break;
+                }
+            }
+            if open {
+                for s in p.blocks[b].exit.successors() {
+                    if !seen[s] {
+                        seen[s] = true;
+                        stack.push((s, 0));
+                    }
+                }
+            }
+        }
+        false
+    };
+    let never = |_: &Inst| false;
+    if reaches(site, &never, &|_, inst| writes(inst)) {
+        return false;
+    }
+    let barrier = |inst: &Inst| inst.name() == "s_barrier";
+    !p.blocks.iter().enumerate().any(|(b, block)| {
+        block.insts.iter().enumerate().any(|(i, inst)| {
+            writes(inst) && reaches((b, i), &barrier, &|s, _| s == site)
+        })
+    })
 }
 
 /// What a register value holds, for [`wave_local`].
