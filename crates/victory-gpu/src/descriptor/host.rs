@@ -860,7 +860,19 @@ pub(crate) type TableKey = (u64, u32, u64);
 /// Frames a shared table is handed out for after it was made: a texture
 /// the title frees and makes again at the same address with the same
 /// record words would otherwise be read through the old view for good.
+/// `VICTORY_SHARED_FRAMES=<n>` sets it (A/B: at 3 fps 8 frames is under
+/// 3 s; hG4 made 524k shared tables and lists took one made by another
+/// list only 291k times).
+fn shared_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SHARED_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(SHARED_FRAMES)
+    })
+}
 const SHARED_FRAMES: u64 = 8;
+
+/// Shared tables found but too old to hand out ([`shared_frames`]).
+static SHARED_AGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Tables lists share: key → (first, count, lists holding it, frame made);
 /// ones aged out but still held: (first, count, lists holding it).
@@ -878,7 +890,12 @@ fn shared_count(made: bool) {
     if made {
         let m = MADE.fetch_add(1, Ordering::Relaxed) + 1;
         if m.is_power_of_two() && m >= 1024 {
-            tracing::info!(made = m, taken = TAKEN.load(Ordering::Relaxed), "shared tables");
+            tracing::info!(
+                made = m,
+                taken = TAKEN.load(Ordering::Relaxed),
+                aged = SHARED_AGED.load(Ordering::Relaxed),
+                "shared tables"
+            );
         }
     } else {
         TAKEN.fetch_add(1, Ordering::Relaxed);
@@ -899,7 +916,8 @@ impl HostHeap {
         let now = crate::frame::current();
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let &mut (first, n, refs, made) = s.map.get_mut(&key)?;
-        if made + SHARED_FRAMES < now {
+        if made + shared_frames() < now {
+            SHARED_AGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             s.map.remove(&key);
             if refs == 0 {
                 drop(s);
