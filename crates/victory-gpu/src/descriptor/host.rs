@@ -2058,7 +2058,38 @@ struct ViewCache {
     step: usize,
     next: u32,
     map: std::collections::HashMap<(usize, Option<[u32; 10]>), Option<u32>>,
-    kept: Vec<ID3D12Resource>,
+    /// The textures cached views name, by address: one reference each.
+    /// The texture sweep (`crate::resource::let_go_idle`) counts it and
+    /// drops the views of what it lets go ([`view_cache_forget`]): as a
+    /// list of every texture viewed it kept them all alive (run mem1:
+    /// 23,690 host textures, 6.5 GB, none ever let go, the card full and
+    /// the material textures never uploaded: black skin and walls).
+    kept: std::collections::HashMap<usize, ID3D12Resource>,
+}
+
+/// How many references the view cache holds on `texture` (0 or 1).
+pub(crate) fn view_cache_holds(texture: &ID3D12Resource) -> u32 {
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let raw = windows::core::Interface::as_raw(texture) as usize;
+    u32::from(views.as_ref().is_some_and(|cache| cache.kept.contains_key(&raw)))
+}
+
+/// Drops the cached views of `textures` (by address) and the references
+/// the cache holds on them; a later view of them is made afresh.
+pub(crate) fn view_cache_forget(textures: &std::collections::HashSet<usize>) {
+    if textures.is_empty() {
+        return;
+    }
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let Some(cache) = views.as_mut() else { return };
+    cache.map.retain(|key, _| !textures.contains(&key.0));
+    let gone: Vec<ID3D12Resource> = textures.iter().filter_map(|raw| cache.kept.remove(raw)).collect();
+    drop(views);
+    // A running submission may still read them through a slot the cache
+    // filled: retired, not released at once.
+    for texture in gone {
+        crate::host::retire(texture);
+    }
 }
 
 const VIEW_CACHE: u32 = 1 << 16;
@@ -2119,7 +2150,7 @@ fn view_cache_put(
                 host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
             )
         };
-        *views = Some(ViewCache { heap, start, step, next: 0, map: Default::default(), kept: Vec::new() });
+        *views = Some(ViewCache { heap, start, step, next: 0, map: Default::default(), kept: Default::default() });
     }
     let cache = views.as_mut().unwrap();
     let _ = &cache.heap;
@@ -2128,8 +2159,8 @@ fn view_cache_put(
         cache.map.clear();
         cache.kept.clear();
     }
-    cache.kept.push(texture.clone());
-    let misses = cache.kept.len();
+    cache.kept.entry(windows::core::Interface::as_raw(texture) as usize).or_insert_with(|| texture.clone());
+    let misses = cache.next as usize + 1;
     if misses.is_power_of_two() && misses >= 64 {
         tracing::info!(misses, hits = VIEW_HITS.load(std::sync::atomic::Ordering::Relaxed), "view cache");
     }

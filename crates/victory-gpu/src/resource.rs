@@ -1413,7 +1413,8 @@ fn room_percent() -> u64 {
 ///   holds the copies of the textures it uses, `HostList::transition`);
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
-///   read it through a slot made earlier, by a table or by an index;
+///   read it through a slot made earlier, by a table or by an index; the
+///   view cache's reference is counted, and its views of it dropped;
 /// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
 ///
 /// The next use makes the host copy anew and uploads the title's memory
@@ -1438,6 +1439,30 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
+    let idle_now = |r: &Resource, host: &std::sync::Arc<HostTexture>, cached: u32| {
+        crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) == 1 + cached
+    };
+    // First the ones whose only other holder is the view cache: their
+    // cached views go, then they are looked at again below with the cache
+    // holding nothing of them.
+    let mut cached_only = std::collections::HashSet::new();
+    for &at in all.iter() {
+        // SAFETY: as below.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && crate::descriptor::host::view_cache_holds(&host.texture) == 1
+            && idle_now(r, host, 1)
+        {
+            cached_only.insert(windows::core::Interface::as_raw(&host.texture) as usize);
+        }
+    }
+    crate::descriptor::host::view_cache_forget(&cached_only);
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
@@ -1447,11 +1472,7 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
+            let idle = made.as_ref().is_some_and(|(host, _)| idle_now(r, host, 0));
             if idle {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
