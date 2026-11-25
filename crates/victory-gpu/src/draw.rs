@@ -1704,10 +1704,30 @@ impl State {
                 });
                 if still_staged && crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    // Past the schedule: looked at again every last interval
+                    // for as long as the slot shows it. In play1 an eighth of
+                    // the textures changed late were found at the last look
+                    // (576 frames, three minutes at 3 fps), and changes kept
+                    // coming: near walls and roofs whose full-size mip the
+                    // title fills later stayed black. `VICTORY_HEAP_RECHECK_FOREVER=0`:
+                    // done after the schedule, as before.
+                    static FOREVER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let forever = *FOREVER
+                        .get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_none_or(|v| v != "0"));
+                    let last = RECHECK_FRAMES.len() - 1;
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
+                        None if forever => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + RECHECK_FRAMES[last],
+                            (at, len),
+                            print,
+                            looks,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
