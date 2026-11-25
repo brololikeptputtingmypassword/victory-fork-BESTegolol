@@ -85,7 +85,10 @@ fn build() -> &'static [u8; 32] {
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
+                    // (`VICTORY_WAVE64_APPROX=<hash>,..` keys only the programs it names: `host_shader`)
+                    if let Some(value) = std::env::var_os(name)
+                        && (name != "VICTORY_WAVE64_APPROX" || value == "1")
+                    {
                         bytes.extend_from_slice(value.as_encoded_bytes());
                     }
                     bytes.push(0);
@@ -109,11 +112,37 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    if approx_listed(container) {
+        // `VICTORY_WAVE64_APPROX=<hash>,..`: this program alone keeps the last-resort wave64
+        // form (a key of its own, so the cache never mixes the two)
+        let translate = |c: &[u8]| {
+            victory_shader::emit::with_wave64_approx(|| victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+        };
+        let build = *blake3::hash(&[&build()[..], b"wave64 approx"].concat()).as_bytes();
+        return match CACHE.get() {
+            Some(cache) => cached(cache, &build, container, translate),
+            None => translate(container),
+        };
+    }
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }
+}
+
+/// Whether `VICTORY_WAVE64_APPROX` lists this container's hash (the 16 hex digits the log
+/// names shaders by).
+fn approx_listed(container: &[u8]) -> bool {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE64_APPROX")
+            .ok()
+            .filter(|v| v != "1")
+            .map(|v| v.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    !list.is_empty() && list.iter().any(|h| *h == blake3::hash(container).to_hex()[..16])
 }
 
 /// The cache entry's converter: the build and the container in, the

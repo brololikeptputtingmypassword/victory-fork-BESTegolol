@@ -271,6 +271,19 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    static APPROX_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` translates with `VICTORY_WAVE64_APPROX` on for this thread only: the programs
+/// `VICTORY_WAVE64_APPROX=<hash>,<hash>` names (the GPU crate picks them by hash).
+pub fn with_wave64_approx<R>(f: impl FnOnce() -> R) -> R {
+    APPROX_HERE.with(|a| a.set(true));
+    let r = f();
+    APPROX_HERE.with(|a| a.set(false));
+    r
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -505,7 +518,8 @@ pub fn emit(
         // and fog volume, 926c46bab3b86bd6). Last of all, the wave-wide branches even where
         // `VICTORY_WAVE_WIDE` leaves them off: their group barriers in branches and loops
         // are a risk taken only for programs that would otherwise not run at all.
-        let approx_on = std::env::var_os("VICTORY_WAVE64_APPROX").is_some_and(|v| v == "1");
+        let approx_on = std::env::var_os("VICTORY_WAVE64_APPROX").is_some_and(|v| v == "1")
+            || APPROX_HERE.with(std::cell::Cell::get);
         if approx_on && !wide_on {
             let deep = form(ir::without_skips(p, true));
             let bases = [

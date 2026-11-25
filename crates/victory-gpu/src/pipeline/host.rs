@@ -597,6 +597,15 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    // `VICTORY_REFUSED_DIR=<dir>`: the refused program's DXIL and root signature
+                    // are written there (`dxc -dumpbin <file>.dxil` reads them back).
+                    if let Some(dir) = std::env::var_os("VICTORY_REFUSED_DIR") {
+                        let dir = std::path::PathBuf::from(dir);
+                        let stem = format!("{shaders:?}").replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), code_bytes(&code(0)));
+                        let _ = std::fs::write(dir.join(format!("{stem}.root")), &root_blob);
+                    }
                     return None;
                 }
             };
