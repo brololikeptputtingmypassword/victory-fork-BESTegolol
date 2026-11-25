@@ -2211,6 +2211,12 @@ impl State {
         }
     }
 
+    /// What the draw about to run finds in its first target (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn history(&self, list: &HostList) -> Option<crate::capture::Rows> {
+        crate::capture::history_before(list, *self.targets.first()? as This)
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -2224,9 +2230,13 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let history = self.history(list);
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::history_after(list, history);
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2956,6 +2966,8 @@ impl State {
             // SAFETY: an open list.
             unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
         }
+        #[cfg(feature = "diagnostics")]
+        let history = if kind == DISPATCH { None } else { self.history(list) };
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -2974,6 +2986,8 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::capture::history_after(list, history);
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);

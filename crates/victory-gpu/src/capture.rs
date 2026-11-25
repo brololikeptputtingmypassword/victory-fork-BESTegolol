@@ -361,6 +361,8 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    history_dump(frame);
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -696,6 +698,225 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+/// With `VICTORY_HISTORY=<rows>` (and `VICTORY_DUMP_TARGETS`): what each mesh
+/// draw of a listed frame changes in its first target (full-size, 8-bit
+/// color), in one row of pixels of every `rows`: the rows are copied before
+/// and after it, and compared when the frame is dumped, into
+/// `frame-<n>-history.txt` (a line for a draw that changed something: its
+/// number, which the operations name as `HISTORY <number>`, and for each row
+/// it changed the first and last pixel, how many, and their mean color).
+#[cfg(feature = "diagnostics")]
+pub(crate) struct Rows {
+    number: usize,
+    target: ID3D12Resource,
+    buffer: ID3D12Resource,
+    format: DXGI_FORMAT,
+    width: u32,
+    count: u32,
+}
+
+#[cfg(feature = "diagnostics")]
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Rows {}
+
+#[cfg(feature = "diagnostics")]
+static HISTORY: std::sync::Mutex<Vec<Rows>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+fn history_step() -> Option<u32> {
+    static STEP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        let step = std::env::var("VICTORY_HISTORY").ok()?.parse().ok()?;
+        (dump_on() && step > 0).then_some(step)
+    })
+}
+
+#[cfg(feature = "diagnostics")]
+impl Rows {
+    fn pitch(&self) -> u32 {
+        (self.width * 4).next_multiple_of(512)
+    }
+
+    /// Records the copy of the rows as they are now (the target is a render
+    /// target, and stays one).
+    fn copy(&self, list: &ID3D12GraphicsCommandList, after: bool) {
+        let (drawn, source) = (D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        let Some(step) = history_step() else { return };
+        // SAFETY: an open list; locations naming live resources, which the
+        // history holds until the frame has run.
+        unsafe {
+            list.ResourceBarrier(&[crate::host::transition(&self.target, drawn, source)]);
+            for row in 0..self.count {
+                let at = row + if after { self.count } else { 0 };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&self.buffer),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: u64::from(at) * u64::from(self.pitch()),
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: self.format,
+                                Width: self.width,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: self.pitch(),
+                            },
+                        },
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&self.target),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let pixels = D3D12_BOX {
+                    left: 0,
+                    top: row * step,
+                    front: 0,
+                    right: self.width,
+                    bottom: row * step + 1,
+                    back: 1,
+                };
+                list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixels));
+            }
+            list.ResourceBarrier(&[crate::host::transition(&self.target, source, drawn)]);
+        }
+    }
+}
+
+/// Before a draw to `target`: its rows as they are, if it has a history.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn history_before(
+    list: &crate::host::HostList,
+    target: crate::object::This,
+) -> Option<Rows> {
+    let step = history_step()?;
+    if !listed(crate::queue::presented() + 1) {
+        return None;
+    }
+    let target = crate::resource::host_resource(target)?;
+    // SAFETY: a live resource.
+    let d = unsafe { target.GetDesc() };
+    if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) || d.Width < 1280 || d.SampleDesc.Count > 1 {
+        return None;
+    }
+    let mut rows = Rows {
+        number: 0,
+        target: target.clone(),
+        buffer: target.clone(),
+        format: d.Format,
+        width: d.Width as u32,
+        count: d.Height / step,
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(rows.pitch()) * u64::from(2 * rows.count),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    unsafe {
+        crate::host::host()?
+            .device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+    }
+    rows.buffer = buffer?;
+    static NUMBER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    rows.number = NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    op(std::ptr::from_ref(list) as usize, || format!("HISTORY {}", rows.number));
+    list.keep(&rows.target);
+    list.keep(&rows.buffer);
+    rows.copy(&list.list, false);
+    Some(rows)
+}
+
+/// After the draw: its rows as it left them.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn history_after(list: &crate::host::HostList, rows: Option<Rows>) {
+    if let Some(rows) = rows {
+        rows.copy(&list.list, true);
+        HISTORY.lock().unwrap_or_else(|e| e.into_inner()).push(rows);
+    }
+}
+
+/// At the dump of frame `frame` (every submission has run): what its draws
+/// changed.
+#[cfg(feature = "diagnostics")]
+fn history_dump(frame: u64) {
+    use std::fmt::Write;
+    let mut draws = std::mem::take(&mut *HISTORY.lock().unwrap_or_else(|e| e.into_inner()));
+    let (Some(folder), Some(step)) = (folder(), history_step()) else {
+        return;
+    };
+    draws.sort_by_key(|d| d.number);
+    let mut text = String::new();
+    for d in &draws {
+        let (pitch, row_bytes) = (d.pitch() as usize, d.width as usize * 4);
+        let half = pitch * d.count as usize;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copies finished; the buffer holds twice `half` bytes.
+        let bytes = unsafe {
+            if d.buffer.Map(0, None, Some(&mut data)).is_err() {
+                continue;
+            }
+            std::slice::from_raw_parts(data.cast::<u8>(), 2 * half)
+        };
+        let mut line = String::new();
+        for row in 0..d.count as usize {
+            let before = &bytes[row * pitch..][..row_bytes];
+            let after = &bytes[half + row * pitch..][..row_bytes];
+            // Runs of changed pixels: a draw covers several things.
+            let mut run: Option<(usize, u64, [u64; 3])> = None;
+            for x in 0..=d.width as usize {
+                let at = x * 4;
+                let changed = x < d.width as usize && before[at..at + 4] != after[at..at + 4];
+                if changed {
+                    let r = run.get_or_insert((x, 0, [0; 3]));
+                    r.1 += 1;
+                    for (s, v) in r.2.iter_mut().zip(&after[at..at + 3]) {
+                        *s += u64::from(*v);
+                    }
+                } else if let Some((first, n, sum)) = run.take()
+                    && n >= 4
+                {
+                    let [r, g, b] = sum.map(|s| s / n);
+                    let _ = write!(line, " y{}:{first}+{n}={r},{g},{b}", row * step as usize);
+                }
+            }
+        }
+        // SAFETY: mapped above.
+        unsafe { d.buffer.Unmap(0, None) };
+        if !line.is_empty() {
+            let _ = writeln!(text, "{} target {:?}{line}", d.number, d.target);
+        }
+    }
+    if !draws.is_empty() {
+        let _ = std::fs::write(folder.join(format!("frame-{frame}-history.txt")), text);
+    }
 }
 
 /// Pixels per side of the grid [`probe`] reads.
